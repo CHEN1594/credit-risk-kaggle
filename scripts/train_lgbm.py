@@ -96,9 +96,8 @@ def main() -> None:
         args.preset,
         cache_dir=cache_dir,
         use_cache=not args.no_cache,
+        sample_rows=args.sample_rows,
     )
-    if args.sample_rows:
-        train = train.sort("case_id").head(args.sample_rows)
 
     train_pdf = to_pandas(train)
     max_week = int(train_pdf["WEEK_NUM"].max())

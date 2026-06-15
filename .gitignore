@@ -1,5 +1,7 @@
 data/
 outputs/
 submission.csv
+notebooks/outputs/
+notebooks/submission.csv
 *.pyc
 __pycache__/

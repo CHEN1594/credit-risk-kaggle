@@ -79,6 +79,21 @@ outputs/lgbm_<preset>/
   submission.csv
 ```
 
+Memory-conscious seed ensemble:
+
+```powershell
+conda run -n hcrisk python scripts/train_lgbm_ensemble.py --preset medium --seeds 42,2024 --skip-refit
+```
+
+The ensemble script has memory guards:
+
+```text
+--max-rss-gb 30
+--min-available-gb 8
+```
+
+If the Python process exceeds 30 GB RSS or system available memory drops below 8 GB, the script stops itself. On a 40 GB RAM machine, keep these defaults unless the machine is otherwise idle.
+
 ## Presets
 
 - `static`: joins only depth=0 static tables. Useful for debugging.
@@ -95,3 +110,12 @@ Validation is a time split on the last `--valid-weeks` of `WEEK_NUM`, and report
 3. Add `--preset full` once the baseline is stable; this includes the very large credit bureau A tables.
 4. Add CatBoost/XGBoost scripts and blend validation/test predictions.
 5. For Kaggle submission, copy or adapt this pipeline into a notebook that writes `/kaggle/working/submission.csv`.
+
+## Kaggle Notebooks
+
+- `notebooks/medium_lgbm_submission.ipynb`: single-seed medium LightGBM submission.
+- `notebooks/medium_lgbm_ensemble_v2.ipynb`: two-seed medium LightGBM ensemble with memory logging and guard checks.
+- `notebooks/medium_a2ultra_blend_v3.ipynb`: sequential medium + a2ultra submission blend. This avoids holding both feature matrices at once.
+- `notebooks/v4_filtered_medium.ipynb`: filtered single-model medium submission intended to reduce Kaggle OOM risk.
+
+Use v1 first if you need the safest submission. Use v2 after v1 has produced a public score.
