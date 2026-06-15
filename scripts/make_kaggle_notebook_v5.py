@@ -62,6 +62,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 import polars as pl
+import pyarrow.parquet as pq
 from pandas.api.types import is_float_dtype, is_integer_dtype
 
 warnings.filterwarnings("ignore")
@@ -123,7 +124,7 @@ sample_submission = pd.read_csv(ROOT / "sample_submission.csv")
 DRY_RUN = sample_submission.shape[0] == 10
 MAX_RSS_GB = 30.0
 MIN_AVAILABLE_GB = 8.0
-CHUNK_SIZE = 200_000
+BATCH_SIZE = 100_000
 
 print({
     "root": str(ROOT),
@@ -141,7 +142,6 @@ print({
     code_cell(
         """
 manifest = json.loads((ARTIFACT_DIR / "v5_manifest.json").read_text(encoding="utf-8"))
-selected_polars_cols = json.loads((ARTIFACT_DIR / manifest["files"]["selected_polars_columns"]).read_text(encoding="utf-8"))
 preprocess_payload = json.loads((ARTIFACT_DIR / manifest["files"]["preprocess"]).read_text(encoding="utf-8"))
 state = PreprocessState(
     feature_cols=preprocess_payload["feature_cols"],
@@ -149,7 +149,6 @@ state = PreprocessState(
     fill_values=preprocess_payload["fill_values"],
     dropped_columns=preprocess_payload["dropped_columns"],
 )
-model = joblib.load(ARTIFACT_DIR / manifest["files"]["model"])
 PRESET = manifest["preset"]
 USE_FLOAT16 = bool(manifest.get("use_float16", False))
 STRING_HASH_SEED = int(manifest.get("string_hash_seed", 42))
@@ -161,7 +160,7 @@ print({
     "n_features": len(state.feature_cols),
     "best_iteration": manifest.get("best_iteration"),
 })
-check_memory("after load artifact", MAX_RSS_GB, MIN_AVAILABLE_GB)
+check_memory("after load metadata", MAX_RSS_GB, MIN_AVAILABLE_GB)
 """
     ),
     code_cell(
@@ -177,7 +176,7 @@ test_pl = build_features(
 print("raw test shape:", test_pl.shape)
 check_memory("after test build", MAX_RSS_GB, MIN_AVAILABLE_GB)
 
-test_pl = select_polars_columns(test_pl, [col for col in selected_polars_cols if col != "target"])
+test_pl = select_polars_columns(test_pl, ["case_id", *state.feature_cols])
 test_pl = hash_string_columns(test_pl, seed=STRING_HASH_SEED)
 print("selected test shape:", test_pl.shape)
 check_memory("after polars select", MAX_RSS_GB, MIN_AVAILABLE_GB)
@@ -191,36 +190,30 @@ check_memory("after write selected test parquet", MAX_RSS_GB, MIN_AVAILABLE_GB)
     ),
     code_cell(
         """
-test_pdf = pd.read_parquet(test_path)
-test_ids = test_pdf["case_id"].to_numpy()
-X_test = apply_preprocessor(test_pdf, state, use_float16=USE_FLOAT16)
-del test_pdf
-gc.collect()
-print("X_test shape:", X_test.shape)
-check_memory("after test preprocess", MAX_RSS_GB, MIN_AVAILABLE_GB)
+model = joblib.load(ARTIFACT_DIR / manifest["files"]["model"])
+check_memory("after load model", MAX_RSS_GB, MIN_AVAILABLE_GB)
 
-matrix_path = WORKING / "test_matrix.csv"
-X_test.to_csv(matrix_path, index=False)
-del X_test
-gc.collect()
-check_memory("after write test matrix and release pandas", MAX_RSS_GB, MIN_AVAILABLE_GB)
-"""
-    ),
-    code_cell(
-        """
 pred_chunks = []
-reader = pd.read_csv(matrix_path, chunksize=CHUNK_SIZE)
-for idx, chunk in enumerate(reader, start=1):
-    check_memory(f"before predict chunk {idx}", MAX_RSS_GB, MIN_AVAILABLE_GB)
-    pred = model.predict_proba(chunk)[:, 1].astype(np.float32)
+id_chunks = []
+parquet_file = pq.ParquetFile(test_path)
+for idx, batch in enumerate(parquet_file.iter_batches(batch_size=BATCH_SIZE), start=1):
+    check_memory(f"before preprocess batch {idx}", MAX_RSS_GB, MIN_AVAILABLE_GB)
+    batch_pdf = batch.to_pandas()
+    id_chunks.append(batch_pdf["case_id"].to_numpy())
+    X_batch = apply_preprocessor(batch_pdf, state, use_float16=USE_FLOAT16)
+    del batch_pdf, batch
+    gc.collect()
+    check_memory(f"before predict batch {idx}", MAX_RSS_GB, MIN_AVAILABLE_GB)
+    pred = model.predict_proba(X_batch)[:, 1].astype(np.float32)
     pred_chunks.append(pred)
-    del chunk, pred
+    del X_batch, pred
     gc.collect()
 
 predictions = np.concatenate(pred_chunks)
-del pred_chunks, reader, model
+test_ids = np.concatenate(id_chunks)
+del pred_chunks, id_chunks, parquet_file, model
 gc.collect()
-check_memory("after chunk prediction", MAX_RSS_GB, MIN_AVAILABLE_GB)
+check_memory("after batch prediction", MAX_RSS_GB, MIN_AVAILABLE_GB)
 
 submission = pd.DataFrame({"case_id": test_ids, "score": predictions})
 submission = sample_submission[["case_id"]].merge(submission, on="case_id", how="left")

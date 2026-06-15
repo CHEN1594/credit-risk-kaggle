@@ -148,3 +148,8 @@
   - best_iteration：`1273`
   - 保留特征数：`556`
 - 正式 artifact 位于：`outputs/lgbm_v5_medium_full/artifact`。
+- v5 notebook 已改为更接近 `example2` 的推理方式：
+  - Kaggle 端不再整表读 test parquet 到 pandas。
+  - 不再写完整 `test_matrix.csv`。
+  - 使用最终模型特征列提前裁剪 test。
+  - 延迟加载模型，先做特征落盘，再按 parquet batch 预处理和预测。

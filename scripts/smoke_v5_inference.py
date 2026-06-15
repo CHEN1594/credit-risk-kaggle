@@ -13,6 +13,7 @@ if str(ROOT) not in sys.path:
 import joblib
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from src.feature_filter import hash_string_columns, select_polars_columns
 from src.features import build_features
@@ -27,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/kaggle_v5_smoke"))
     parser.add_argument("--max-rss-gb", type=float, default=30.0)
     parser.add_argument("--min-available-gb", type=float, default=8.0)
-    parser.add_argument("--chunk-size", type=int, default=200_000)
+    parser.add_argument("--batch-size", type=int, default=100_000)
     return parser.parse_args()
 
 
@@ -35,9 +36,6 @@ def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     manifest = json.loads((args.artifact_dir / "v5_manifest.json").read_text(encoding="utf-8"))
-    selected_polars_cols = json.loads(
-        (args.artifact_dir / manifest["files"]["selected_polars_columns"]).read_text(encoding="utf-8")
-    )
     preprocess_payload = json.loads((args.artifact_dir / manifest["files"]["preprocess"]).read_text(encoding="utf-8"))
     state = PreprocessState(
         feature_cols=preprocess_payload["feature_cols"],
@@ -45,7 +43,6 @@ def main() -> None:
         fill_values=preprocess_payload["fill_values"],
         dropped_columns=preprocess_payload["dropped_columns"],
     )
-    model = joblib.load(args.artifact_dir / manifest["files"]["model"])
     sample_submission = pd.read_csv(args.data_dir / "sample_submission.csv")
 
     check_memory("before test build", args.max_rss_gb, args.min_available_gb)
@@ -56,7 +53,7 @@ def main() -> None:
         cache_dir=args.output_dir / "features",
         use_cache=True,
     )
-    test_pl = select_polars_columns(test_pl, [col for col in selected_polars_cols if col != "target"])
+    test_pl = select_polars_columns(test_pl, ["case_id", *state.feature_cols])
     test_pl = hash_string_columns(test_pl, seed=int(manifest.get("string_hash_seed", 42)))
     test_path = args.output_dir / "test_selected.parquet"
     test_pl.write_parquet(test_path)
@@ -64,23 +61,18 @@ def main() -> None:
     gc.collect()
     check_memory("after write selected test parquet", args.max_rss_gb, args.min_available_gb)
 
-    test_pdf = pd.read_parquet(test_path)
-    test_ids = test_pdf["case_id"].to_numpy()
-    X_test = apply_preprocessor(test_pdf, state, use_float16=bool(manifest.get("use_float16", False)))
-    del test_pdf
-    gc.collect()
-
-    matrix_path = args.output_dir / "test_matrix.csv"
-    X_test.to_csv(matrix_path, index=False)
-    del X_test
-    gc.collect()
-    check_memory("after write test matrix", args.max_rss_gb, args.min_available_gb)
-
+    model = joblib.load(args.artifact_dir / manifest["files"]["model"])
     pred_chunks = []
-    for chunk in pd.read_csv(matrix_path, chunksize=args.chunk_size):
-        pred_chunks.append(model.predict_proba(chunk)[:, 1].astype(np.float32))
-        del chunk
+    id_chunks = []
+    parquet_file = pq.ParquetFile(test_path)
+    for batch in parquet_file.iter_batches(batch_size=args.batch_size):
+        batch_pdf = batch.to_pandas()
+        id_chunks.append(batch_pdf["case_id"].to_numpy())
+        X_batch = apply_preprocessor(batch_pdf, state, use_float16=bool(manifest.get("use_float16", False)))
+        pred_chunks.append(model.predict_proba(X_batch)[:, 1].astype(np.float32))
+        del batch, batch_pdf, X_batch
     predictions = np.concatenate(pred_chunks)
+    test_ids = np.concatenate(id_chunks)
 
     submission = pd.DataFrame({"case_id": test_ids, "score": predictions})
     submission = sample_submission[["case_id"]].merge(submission, on="case_id", how="left")
