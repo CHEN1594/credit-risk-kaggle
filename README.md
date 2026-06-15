@@ -64,6 +64,18 @@ This writes:
 outputs/local_smoke_submission.csv
 ```
 
+Run a rolling-window CV experiment from a filtered feature parquet:
+
+```powershell
+conda run -n hcrisk python scripts/cv_features.py --run-dir outputs/experiments/lgbm_v5_medium_ranges_stable_sample300000
+```
+
+Exploratory feature analysis scripts live under:
+
+```text
+feature_lab/
+```
+
 Retrain from local data in two stages:
 
 ```powershell
@@ -84,4 +96,3 @@ Features:   556
 ```
 
 Validation uses the last 20 `WEEK_NUM` values from the training data.
-

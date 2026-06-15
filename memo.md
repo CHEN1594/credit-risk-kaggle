@@ -35,3 +35,15 @@
 
 Kaggle notebook 不能直接 import 本地 `src/`，所以 `scripts/build_notebook.py` 会把 `src/` 里的必要代码嵌入到 notebook。
 
+## 2026-06-16 特征实验
+
+- 新增多窗口 CV：`scripts/cv_features.py`。
+- 新增探索目录：`feature_lab/`。
+- 300k 样本、3 个 20-week 窗口结果：
+  - baseline `none`：mean stability `0.3037`，min `0.0626`。
+  - `ranges_stable`：mean stability `0.3488`，min `0.1434`，目前多窗口最好。
+  - `missing`、`counts`、`ratios`、`last`、`ranges_stable+last` 均未通过多窗口筛选。
+- full `ranges_stable` 训练：
+  - Stability `0.7067`，略低于当前 submission artifact 的 `0.7075`。
+  - 因此暂不覆盖 `submission/artifact`。
+- 结论：`ranges_stable` 方向值得后续继续细化，但当前正式提交仍保持原 v5 artifact。

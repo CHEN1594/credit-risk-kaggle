@@ -17,7 +17,7 @@ import pandas as pd
 from sklearn.metrics import roc_auc_score
 
 from src.feature_filter import filter_polars_columns, hash_string_columns
-from src.features import PRESETS, build_features
+from src.features import PRESETS, build_features, derived_output_columns
 from src.memory import MemoryLimitExceeded, check_memory
 from src.metric import gini_score, stability_metric
 from src.preprocess import apply_preprocessor, fit_preprocessor, summarize_drops
@@ -28,6 +28,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--data-dir", type=Path, default=Path("data"))
     parser.add_argument("--output-dir", type=Path, default=Path("outputs"))
     parser.add_argument("--preset", choices=sorted(PRESETS), default="medium")
+    parser.add_argument("--feature-set", default="none")
+    parser.add_argument("--template-columns", type=Path, default=None)
     parser.add_argument("--valid-weeks", type=int, default=20)
     parser.add_argument("--n-estimators", type=int, default=1800)
     parser.add_argument("--early-stopping-rounds", type=int, default=150)
@@ -81,14 +83,19 @@ def memory_callback(args: argparse.Namespace, label: str):
 
 def main() -> None:
     args = parse_args()
-    suffix = "sample" if args.sample_rows else "full"
-    run_dir = args.output_dir / f"lgbm_v5_{args.preset}_{suffix}"
+    suffix = f"sample{args.sample_rows}" if args.sample_rows else "full"
+    run_dir = args.output_dir / f"lgbm_v5_{args.preset}_{args.feature_set}_{suffix}"
     artifact_dir = run_dir / "artifact"
     run_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     def guard(label: str) -> None:
         check_memory(label, args.max_rss_gb, args.min_available_gb)
+
+    output_columns = None
+    if args.template_columns is not None:
+        output_columns = json.loads(args.template_columns.read_text(encoding="utf-8"))
+        output_columns = list(dict.fromkeys(output_columns + derived_output_columns(args.feature_set)))
 
     guard("start")
     train_pl = build_features(
@@ -98,6 +105,8 @@ def main() -> None:
         cache_dir=args.output_dir / "features",
         use_cache=True,
         sample_rows=args.sample_rows,
+        feature_set=args.feature_set,
+        output_columns=output_columns,
     )
     print("raw train shape:", train_pl.shape)
     guard("after build train features")
@@ -119,12 +128,14 @@ def main() -> None:
     feature_metadata = {
         "version": "v5",
         "preset": args.preset,
+        "feature_set": args.feature_set,
         "sample_rows": int(args.sample_rows),
         "max_missing": float(args.max_missing),
         "max_cat_unique": int(args.max_cat_unique),
         "use_float16": bool(args.use_float16),
         "string_hash_seed": int(args.seed),
         "selected_polars_columns": selected_polars_cols,
+        "template_columns": output_columns,
         "polars_drops": polars_drops,
         "train_filtered_path": str(train_path),
     }
@@ -235,6 +246,7 @@ def main() -> None:
         "version": "v5",
         "model_kind": final_kind,
         "preset": args.preset,
+        "feature_set": args.feature_set,
         "max_missing": float(args.max_missing),
         "max_cat_unique": int(args.max_cat_unique),
         "use_float16": bool(args.use_float16),

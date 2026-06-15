@@ -149,6 +149,7 @@ state = PreprocessState(
     dropped_columns=preprocess_payload["dropped_columns"],
 )
 PRESET = manifest["preset"]
+FEATURE_SET = manifest.get("feature_set", "none")
 USE_FLOAT16 = bool(manifest.get("use_float16", False))
 STRING_HASH_SEED = int(manifest.get("string_hash_seed", 42))
 
@@ -156,6 +157,7 @@ print({
     "manifest_version": manifest.get("version"),
     "model_kind": manifest.get("model_kind"),
     "preset": PRESET,
+    "feature_set": FEATURE_SET,
     "n_features": len(state.feature_cols),
     "best_iteration": manifest.get("best_iteration"),
 })
@@ -171,6 +173,8 @@ test_pl = build_features(
     PRESET,
     cache_dir=WORKING / "features",
     use_cache=True,
+    feature_set=FEATURE_SET,
+    output_columns=["case_id", *state.feature_cols],
 )
 print("raw test shape:", test_pl.shape)
 check_memory("after test build", MAX_RSS_GB, MIN_AVAILABLE_GB)

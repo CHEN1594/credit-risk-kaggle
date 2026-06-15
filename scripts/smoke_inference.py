@@ -57,6 +57,8 @@ def main() -> None:
         manifest["preset"],
         cache_dir=temp_dir / "features",
         use_cache=False,
+        feature_set=manifest.get("feature_set", "none"),
+        output_columns=["case_id", *state.feature_cols],
     )
     test_pl = select_polars_columns(test_pl, ["case_id", *state.feature_cols])
     test_pl = hash_string_columns(test_pl, seed=int(manifest.get("string_hash_seed", 42)))

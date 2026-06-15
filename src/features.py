@@ -228,10 +228,14 @@ def aggregate_group(
     split: str,
     group: str,
     case_ids: pl.LazyFrame | None = None,
+    feature_set: str = "none",
 ) -> pl.LazyFrame:
     lf = normalize_dates(scan_group(data_dir, split, group))
     lf = filter_cases(lf, case_ids)
     schema = lf.collect_schema()
+    components = feature_set_components(feature_set)
+    if "last" in components and "num_group1" in schema:
+        lf = lf.sort(["case_id", "num_group1"])
     aggs: list[pl.Expr] = [pl.len().alias(f"{group}__row_count")]
 
     for col, dtype in schema.items():
@@ -248,6 +252,8 @@ def aggregate_group(
                     base.std().alias(f"{out}__std"),
                 ]
             )
+            if "last" in components:
+                aggs.append(base.last().alias(f"{out}__last"))
         else:
             aggs.append(pl.col(col).n_unique().alias(f"{out}__nunique"))
 
@@ -364,6 +370,186 @@ def aggregate_large_group_lite_eager(
     return partial_lf.group_by("case_id").agg(final_aggs).collect(engine="streaming")
 
 
+def _safe_ratio_expr(numerator: str, denominator: str, alias: str) -> pl.Expr:
+    den = pl.col(denominator).cast(pl.Float64, strict=False)
+    num = pl.col(numerator).cast(pl.Float64, strict=False)
+    return pl.when(den.abs() > 1e-6).then(num / den).otherwise(None).alias(alias)
+
+
+RATIO_PAIRS: tuple[tuple[str, str, str], ...] = (
+    ("annuity_780A", "credamount_770A", "derived__annuity_to_credamount"),
+    ("annuitynextmonth_57A", "annuity_780A", "derived__next_annuity_to_annuity"),
+    ("currdebt_22A", "credamount_770A", "derived__currdebt_to_credamount"),
+    ("disbursedcredamount_1113A", "credamount_770A", "derived__disbursed_to_credamount"),
+    ("downpmt_116A", "credamount_770A", "derived__downpmt_to_credamount"),
+    ("maxannuity_159A", "annuity_780A", "derived__maxannuity_to_annuity"),
+    ("lastapprcredamount_781A", "credamount_770A", "derived__lastappr_to_credamount"),
+    ("lastrejectcredamount_222A", "credamount_770A", "derived__lastreject_to_credamount"),
+    ("avgpmtlast12m_4525200A", "annuity_780A", "derived__avgpmt_to_annuity"),
+    ("avgoutstandbalancel6m_4187114A", "credamount_770A", "derived__avgoutstand_to_credamount"),
+    (
+        "credit_bureau_a_1__overdueamount_31A__max",
+        "credit_bureau_a_1__outstandingamount_354A__max",
+        "derived__bureau_overdue_to_outstanding_max",
+    ),
+    (
+        "credit_bureau_a_1__overdueamount_659A__max",
+        "credit_bureau_a_1__outstandingamount_362A__max",
+        "derived__bureau_overdue2_to_outstanding2_max",
+    ),
+    ("applprev_1__annuity_853A__mean", "annuity_780A", "derived__prev_annuity_mean_to_current"),
+    ("applprev_1__credamount_590A__mean", "credamount_770A", "derived__prev_credamount_mean_to_current"),
+)
+
+
+STABLE_RANGE_MAX_COLUMNS: tuple[str, ...] = (
+    "credit_bureau_a_1__numberofoverdueinstlmax_1151L__max",
+    "credit_bureau_a_1__lastupdate_388D__max",
+    "credit_bureau_a_1__dateofrealrepmt_138D__max",
+    "credit_bureau_a_1__dpdmax_757P__max",
+    "credit_bureau_a_1__overdueamountmaxdateyear_994T__max",
+    "credit_bureau_a_1__dpdmaxdateyear_896T__max",
+    "credit_bureau_a_1__dateofcredend_353D__max",
+    "credit_bureau_a_1__dateofcredstart_181D__max",
+    "credit_bureau_a_1__nominalrate_498L__max",
+    "credit_bureau_a_1__totalamount_6A__max",
+    "credit_bureau_a_1__overdueamountmax_35A__max",
+    "credit_bureau_a_1__numberofinstls_229L__max",
+    "credit_bureau_a_1__overdueamountmax2_398A__max",
+    "credit_bureau_a_1__dpdmax_139P__max",
+    "credit_bureau_a_1__overdueamountmax_155A__max",
+    "credit_bureau_a_1__numberofoverdueinstlmax_1039L__max",
+    "credit_bureau_a_1__overdueamountmax2_14A__max",
+    "tax_registry_c_1__pmtamount_36A__max",
+    "credit_bureau_a_1__dpdmaxdatemonth_442T__max",
+    "credit_bureau_a_1__overdueamountmaxdatemonth_284T__max",
+    "credit_bureau_a_1__monthlyinstlamount_674A__max",
+    "applprev_1__maxdpdtolerance_577P__max",
+    "credit_bureau_a_1__numberofoverdueinstlmaxdat_148D__max",
+)
+
+
+def feature_set_components(feature_set: str) -> set[str]:
+    if feature_set in ("", "none", "v5"):
+        return set()
+    if feature_set == "light1":
+        return {"missing", "counts", "ratios", "ranges"}
+    components = set(feature_set.split("+"))
+    allowed = {"missing", "counts", "ratios", "ranges", "ranges_stable", "last"}
+    unknown = components - allowed
+    if unknown:
+        raise ValueError(
+            "Unknown feature_set components {!r}. Available: none, light1, or + combinations of {}".format(
+                sorted(unknown), sorted(allowed)
+            )
+        )
+    return components
+
+
+def derived_output_columns(feature_set: str) -> list[str]:
+    components = feature_set_components(feature_set)
+    outputs: list[str] = []
+    if "missing" in components:
+        outputs.extend(["derived__null_count", "derived__amount_null_count"])
+    if "ratios" in components:
+        outputs.extend(alias for _, _, alias in RATIO_PAIRS)
+    if "ranges_stable" in components:
+        outputs.extend(f"{col[:-5]}__range" for col in STABLE_RANGE_MAX_COLUMNS)
+    return outputs
+
+
+def required_raw_columns_for_outputs(output_columns: list[str], feature_set: str) -> list[str]:
+    required: set[str] = set(output_columns)
+    components = feature_set_components(feature_set)
+    outputs = set(output_columns)
+    if "ratios" in components:
+        for numerator, denominator, alias in RATIO_PAIRS:
+            if alias in outputs:
+                required.add(numerator)
+                required.add(denominator)
+    if "ranges_stable" in components:
+        for col in STABLE_RANGE_MAX_COLUMNS:
+            alias = f"{col[:-5]}__range"
+            if alias in outputs:
+                required.add(col)
+                required.add(f"{col[:-5]}__min")
+    return list(required)
+
+
+def apply_derived_features(df: pl.DataFrame, feature_set: str) -> pl.DataFrame:
+    components = feature_set_components(feature_set)
+    if not components:
+        return df
+
+    protected = {"case_id", "target"}
+    feature_cols = [col for col in df.columns if col not in protected]
+    exprs: list[pl.Expr] = []
+
+    if "missing" in components and feature_cols:
+        exprs.append(
+            pl.sum_horizontal([pl.col(col).is_null().cast(pl.Int16) for col in feature_cols]).alias(
+                "derived__null_count"
+            )
+        )
+        amount_cols = [col for col in feature_cols if col.endswith("A")]
+        if amount_cols:
+            exprs.append(
+                pl.sum_horizontal([pl.col(col).is_null().cast(pl.Int16) for col in amount_cols]).alias(
+                    "derived__amount_null_count"
+                )
+            )
+
+    if "counts" in components:
+        for col in [col for col in df.columns if col.endswith("__row_count")]:
+            base = pl.col(col).cast(pl.Float64, strict=False)
+            exprs.extend(
+                [
+                    (base > 0).cast(pl.Int8).alias(f"{col}__has_record"),
+                    base.log1p().alias(f"{col}__log1p"),
+                ]
+            )
+
+    if "ratios" in components:
+        for numerator, denominator, alias in RATIO_PAIRS:
+            if numerator in df.columns and denominator in df.columns:
+                exprs.append(_safe_ratio_expr(numerator, denominator, alias))
+
+    if "ranges_stable" in components:
+        for col in STABLE_RANGE_MAX_COLUMNS:
+            min_col = f"{col[:-5]}__min"
+            if col in df.columns and min_col in df.columns:
+                exprs.append(
+                    (
+                        pl.col(col).cast(pl.Float64, strict=False)
+                        - pl.col(min_col).cast(pl.Float64, strict=False)
+                    ).alias(f"{col[:-5]}__range")
+                )
+
+    if "ranges" in components:
+        range_keywords = ("amount", "debt", "dpd", "annuity", "cred")
+        range_exprs = []
+        for col in df.columns:
+            if not col.endswith("__max"):
+                continue
+            min_col = f"{col[:-5]}__min"
+            if min_col not in df.columns:
+                continue
+            lowered = col.lower()
+            if not any(keyword in lowered for keyword in range_keywords):
+                continue
+            range_exprs.append(
+                (
+                    pl.col(col).cast(pl.Float64, strict=False)
+                    - pl.col(min_col).cast(pl.Float64, strict=False)
+                ).alias(f"{col[:-5]}__range")
+            )
+            if len(range_exprs) >= 80:
+                break
+        exprs.extend(range_exprs)
+
+    return df.with_columns(exprs) if exprs else df
+
+
 def build_features(
     data_dir: Path,
     split: str,
@@ -371,6 +557,8 @@ def build_features(
     cache_dir: Path | None = None,
     use_cache: bool = True,
     sample_rows: int = 0,
+    feature_set: str = "none",
+    output_columns: list[str] | None = None,
 ) -> pl.DataFrame:
     if preset_name not in PRESETS:
         raise ValueError(f"Unknown preset {preset_name!r}. Available: {sorted(PRESETS)}")
@@ -378,7 +566,7 @@ def build_features(
 
     cache_path = None
     if cache_dir is not None and not sample_rows:
-        cache_path = cache_dir / f"{split}_{preset_name}_features.parquet"
+        cache_path = cache_dir / f"{split}_{preset_name}_{feature_set}_features.parquet"
         if use_cache and cache_path.exists():
             return pl.read_parquet(cache_path)
 
@@ -389,7 +577,12 @@ def build_features(
     for group in preset.depth0_groups:
         lf = lf.join(load_depth0(data_dir, split, group, case_ids), on="case_id", how="left")
     for group in preset.aggregate_groups:
-        lf = lf.join(aggregate_group(data_dir, split, group, case_ids), on="case_id", how="left")
+        lf = lf.join(aggregate_group(data_dir, split, group, case_ids, feature_set), on="case_id", how="left")
+    if output_columns is not None:
+        wanted = set(required_raw_columns_for_outputs(output_columns, feature_set))
+        wanted.update(["case_id", "target", "WEEK_NUM"])
+        schema = lf.collect_schema()
+        lf = lf.select([col for col in schema.names() if col in wanted])
     df = lf.collect(engine="streaming")
     if preset.lite_large_groups:
         case_ids_df = df.select("case_id")
@@ -403,6 +596,11 @@ def build_features(
                 case_ids=case_ids_df if sample_rows else None,
             )
             df = df.join(lite, on="case_id", how="left")
+    df = apply_derived_features(df, feature_set)
+    if output_columns is not None:
+        wanted = set(output_columns)
+        wanted.update(["case_id", "target"])
+        df = df.select([col for col in df.columns if col in wanted])
     if cache_path is not None and not sample_rows:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         df.write_parquet(cache_path)
