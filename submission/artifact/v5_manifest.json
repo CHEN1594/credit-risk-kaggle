@@ -1,0 +1,46 @@
+{
+  "version": "v5",
+  "model_kind": "refit_all",
+  "preset": "medium",
+  "max_missing": 0.7,
+  "max_cat_unique": 200,
+  "use_float16": false,
+  "string_hash_seed": 42,
+  "best_iteration": 1273,
+  "metrics": {
+    "auc": 0.8626692303926787,
+    "gini": 0.7253384607853575,
+    "valid_start_week": 72,
+    "valid_rows": 212203,
+    "train_rows": 1314456,
+    "best_iteration": 1273,
+    "preset": "medium",
+    "sample_rows": 0,
+    "max_missing": 0.7,
+    "max_cat_unique": 200,
+    "polars_drop_summary": {
+      "missing": 375,
+      "constant": 4,
+      "high_cardinality": 2
+    },
+    "drop_summary": {
+      "missing": 0,
+      "constant": 10,
+      "high_cardinality": 0,
+      "kept": 556
+    },
+    "n_features": 556,
+    "stability": 0.7074691951118831,
+    "mean_gini": 0.7210303939091088,
+    "slope": 0.00138466620877055,
+    "falling_rate": 0.0,
+    "residual_std": 0.027122397594451553,
+    "n_weeks": 20.0
+  },
+  "files": {
+    "model": "model.joblib",
+    "preprocess": "preprocess.json",
+    "feature_columns": "feature_columns.json",
+    "selected_polars_columns": "selected_polars_columns.json"
+  }
+}
