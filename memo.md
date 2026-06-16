@@ -317,3 +317,9 @@ Kaggle notebook 不能直接 import 本地 `src/`，所以 `scripts/build_notebo
   - Stability `0.7067`，略低于当前 submission artifact 的 `0.7075`。
   - 因此暂不覆盖 `submission/artifact`。
 - 结论：`ranges_stable` 方向值得继续细化，但当前正式提交仍保持原 v5 artifact。
+
+
+
+## 特征工程的notes
+
+1. 语义出发， 构建有价值的 2. 基础体检 也就是构建前后就需要去看一下这个缺少值啥的， 看看适不适合， 不只是之后要做哦， 构建前也需要哦， 3. 看iv值之类的进行参考。 4.小批量训练看看效果

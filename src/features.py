@@ -6,7 +6,7 @@ from pathlib import Path
 import polars as pl
 
 
-SPECIAL_COLUMNS = {"case_id", "num_group1", "num_group2"}
+SPECIAL_COLUMNS = {"case_id", "num_group1", "num_group2", "__decision_date"}
 
 
 @dataclass(frozen=True)
@@ -153,6 +153,18 @@ TWOSTAGE_OVERDUE_COLUMNS = {
     "pmts_overdue_1140A",
     "pmts_overdue_1152A",
 }
+TWOSTAGE_ACTIVE_COLUMNS = {
+    "pmts_dpd_1073P",
+    "pmts_overdue_1140A",
+    "pmts_month_158T",
+    "pmts_year_1139T",
+}
+TWOSTAGE_CLOSED_COLUMNS = {
+    "pmts_dpd_303P",
+    "pmts_overdue_1152A",
+    "pmts_month_706T",
+    "pmts_year_507T",
+}
 
 
 def split_dir(data_dir: Path, split: str) -> Path:
@@ -210,6 +222,150 @@ def normalize_dates(lf: pl.LazyFrame) -> pl.LazyFrame:
     return lf.with_columns(exprs) if exprs else lf
 
 
+def is_date_column(col: str) -> bool:
+    return col.endswith("D") or col == "date_decision"
+
+
+def column_family(col: str) -> str:
+    lowered = col.lower()
+    if any(token in lowered for token in ("dpd", "overdue", "pastdue")) or col.endswith("P"):
+        return "delinquency"
+    if any(
+        token in lowered
+        for token in (
+            "amount",
+            "amt",
+            "annuity",
+            "balance",
+            "cred",
+            "debt",
+            "income",
+            "price",
+            "sum",
+            "turnover",
+            "pmtamount",
+        )
+    ) or col.endswith("A"):
+        return "amount"
+    if any(token in lowered for token in ("num", "cnt", "count", "instl", "term", "month", "year")) or col.endswith("L"):
+        return "count_term"
+    if "rate" in lowered or "eir" in lowered or "interest" in lowered:
+        return "rate"
+    if is_date_column(col):
+        return "date"
+    return "other"
+
+
+def numeric_expr(col: str) -> pl.Expr:
+    return pl.col(col).cast(pl.Float64, strict=False)
+
+
+def custom_numeric_ops(group: str, col: str, dtype: pl.DataType) -> tuple[str, ...]:
+    family = column_family(col)
+    if dtype == pl.Boolean:
+        return ("max", "last")
+
+    if group.startswith("person_"):
+        if "income" in col.lower():
+            return ("max", "first", "last")
+        if is_date_column(col):
+            return ("first", "last", "max", "min")
+        return ("first", "last")
+
+    if group in {"deposit_1", "debitcard_1"}:
+        return ("max", "min")
+
+    if group == "other_1":
+        return ("first",)
+
+    if group.startswith("tax_registry_"):
+        return ("max", "min", "first", "last", "mean", "std")
+
+    if group == "credit_bureau_a_1":
+        if family in {"amount", "rate", "count_term", "delinquency"}:
+            return ("max", "min", "mean", "std", "sum", "median", "first")
+        if family == "date":
+            return ("max", "min", "first", "last")
+        return ("max", "min")
+
+    if group == "applprev_1":
+        if family in {"amount", "count_term", "delinquency"}:
+            return ("max", "min", "mean", "std", "sum", "median")
+        if family == "date":
+            return ("max", "min", "first", "last")
+        return ("max", "min")
+
+    if group == "applprev_2":
+        return ("first", "last", "nunique")
+
+    if group.startswith("credit_bureau_b_"):
+        if family in {"amount", "count_term", "delinquency"}:
+            return ("max", "min", "mean", "std", "sum")
+        if family == "date":
+            return ("max", "min", "first", "last")
+        return ("max", "min")
+
+    return ("max", "min")
+
+
+def custom_categorical_ops(group: str, col: str) -> tuple[str, ...]:
+    if group == "other_1":
+        return ("first",)
+    if group.startswith("person_"):
+        return ("first", "last")
+    if group in {"deposit_1", "debitcard_1"}:
+        return ("first", "last", "nunique")
+    if group.startswith("tax_registry_"):
+        return ("first", "last", "nunique")
+    if group in {"applprev_1", "applprev_2"}:
+        return ("first", "last", "nunique")
+    if group.startswith("credit_bureau_a_") or group.startswith("credit_bureau_b_"):
+        return ("first", "last", "nunique")
+    return ("nunique",)
+
+
+def append_agg_ops(aggs: list[pl.Expr], base: pl.Expr, out: str, ops: tuple[str, ...]) -> None:
+    for op in ops:
+        if op == "mean":
+            aggs.append(base.mean().alias(f"{out}__mean"))
+        elif op == "max":
+            aggs.append(base.max().alias(f"{out}__max"))
+        elif op == "min":
+            aggs.append(base.min().alias(f"{out}__min"))
+        elif op == "std":
+            aggs.append(base.std().alias(f"{out}__std"))
+        elif op == "sum":
+            aggs.append(base.sum().alias(f"{out}__sum"))
+        elif op == "median":
+            aggs.append(base.median().alias(f"{out}__median"))
+        elif op == "first":
+            aggs.append(base.first().alias(f"{out}__first"))
+        elif op == "last":
+            aggs.append(base.last().alias(f"{out}__last"))
+        elif op == "nunique":
+            aggs.append(base.n_unique().alias(f"{out}__nunique"))
+        else:
+            raise ValueError(f"Unknown aggregation op: {op}")
+
+
+def use_custom_aggs_for_group(components: set[str], group: str) -> bool:
+    if "table_custom_aggs" in components:
+        return True
+    if "custom_person_aggs" in components and group.startswith("person_"):
+        return True
+    if "custom_deposit_debitcard_aggs" in components and group in {"deposit_1", "debitcard_1"}:
+        return True
+    if "custom_bureau_a1_aggs" in components and group == "credit_bureau_a_1":
+        return True
+    if "custom_applprev_aggs" in components and group.startswith("applprev_"):
+        return True
+    if "custom_tax_aggs" in components and group.startswith("tax_registry_"):
+        return True
+    if "custom_other_aggs" in components and group == "other_1":
+        return True
+    return False
+
+
 def load_base(data_dir: Path, split: str) -> pl.LazyFrame:
     return normalize_dates(scan_group(data_dir, split, "base"))
 
@@ -237,12 +393,19 @@ def aggregate_group(
     group: str,
     case_ids: pl.LazyFrame | None = None,
     feature_set: str = "none",
+    decision_dates: pl.LazyFrame | None = None,
 ) -> pl.LazyFrame:
     lf = normalize_dates(scan_group(data_dir, split, group))
     lf = filter_cases(lf, case_ids)
     schema = lf.collect_schema()
     components = feature_set_components(feature_set)
+    custom_aggs = use_custom_aggs_for_group(components, group)
+    if custom_aggs and decision_dates is not None:
+        lf = lf.join(decision_dates, on="case_id", how="left")
+        schema = lf.collect_schema()
     if "last" in components and "num_group1" in schema:
+        lf = lf.sort(["case_id", "num_group1"])
+    elif custom_aggs and "num_group1" in schema:
         lf = lf.sort(["case_id", "num_group1"])
     aggs: list[pl.Expr] = [pl.len().alias(f"{group}__row_count")]
 
@@ -250,20 +413,23 @@ def aggregate_group(
         if col in SPECIAL_COLUMNS:
             continue
         out = f"{group}__{col}"
-        if dtype.is_numeric() or dtype == pl.Boolean or col.endswith("D"):
-            base = pl.col(col).cast(pl.Float64, strict=False)
-            aggs.extend(
-                [
-                    base.mean().alias(f"{out}__mean"),
-                    base.max().alias(f"{out}__max"),
-                    base.min().alias(f"{out}__min"),
-                    base.std().alias(f"{out}__std"),
-                ]
-            )
+        if custom_aggs:
+            if dtype.is_numeric() or dtype == pl.Boolean or is_date_column(col):
+                base = numeric_expr(col)
+                if is_date_column(col) and "__decision_date" in schema:
+                    base = numeric_expr("__decision_date") - numeric_expr(col)
+                append_agg_ops(aggs, base, out, custom_numeric_ops(group, col, dtype))
+                if group.startswith("tax_registry_") and column_family(col) == "amount":
+                    aggs.append((base.max() - base.min()).alias(f"{out}__gap"))
+            else:
+                append_agg_ops(aggs, pl.col(col), out, custom_categorical_ops(group, col))
+        elif dtype.is_numeric() or dtype == pl.Boolean or col.endswith("D"):
+            base = numeric_expr(col)
+            append_agg_ops(aggs, base, out, ("mean", "max", "min", "std"))
             if "last" in components:
-                aggs.append(base.last().alias(f"{out}__last"))
+                append_agg_ops(aggs, base, out, ("last",))
         else:
-            aggs.append(pl.col(col).n_unique().alias(f"{out}__nunique"))
+            append_agg_ops(aggs, pl.col(col), out, ("nunique",))
 
     return lf.group_by("case_id").agg(aggs)
 
@@ -417,6 +583,17 @@ def aggregate_large_group_twostage_eager(
             pl.col("num_group2").min().alias(f"{group}__contract__num_group2_min"),
         ]
         overdue_flags: list[pl.Expr] = []
+        dpd_gt0_exprs: list[pl.Expr] = []
+        dpd_gt30_exprs: list[pl.Expr] = []
+        dpd_gt60_exprs: list[pl.Expr] = []
+        dpd_gt90_exprs: list[pl.Expr] = []
+        overdue_amt_gt0_exprs: list[pl.Expr] = []
+        active_payment_exprs: list[pl.Expr] = []
+        closed_payment_exprs: list[pl.Expr] = []
+        active_dpd_gt30_exprs: list[pl.Expr] = []
+        closed_dpd_gt30_exprs: list[pl.Expr] = []
+        active_overdue_amt_gt0_exprs: list[pl.Expr] = []
+        closed_overdue_amt_gt0_exprs: list[pl.Expr] = []
         for col in available:
             base = pl.col(col).cast(pl.Float64, strict=False)
             prefix = f"{group}__contract__{col}"
@@ -433,12 +610,140 @@ def aggregate_large_group_twostage_eager(
             )
             if col in TWOSTAGE_OVERDUE_COLUMNS:
                 overdue_flags.append(base.fill_null(0) > 0)
+            if col in TWOSTAGE_ACTIVE_COLUMNS:
+                active_payment_exprs.append(base.is_not_null())
+            if col in TWOSTAGE_CLOSED_COLUMNS:
+                closed_payment_exprs.append(base.is_not_null())
+            if col in {"pmts_dpd_1073P", "pmts_dpd_303P"}:
+                clean = base.fill_null(0)
+                dpd_gt0_exprs.append(clean > 0)
+                dpd_gt30_exprs.append(clean > 30)
+                dpd_gt60_exprs.append(clean > 60)
+                dpd_gt90_exprs.append(clean > 90)
+                if col == "pmts_dpd_1073P":
+                    active_dpd_gt30_exprs.append(clean > 30)
+                if col == "pmts_dpd_303P":
+                    closed_dpd_gt30_exprs.append(clean > 30)
+            if col in {"pmts_overdue_1140A", "pmts_overdue_1152A"}:
+                overdue_amt_gt0_exprs.append(base.fill_null(0) > 0)
+                if col == "pmts_overdue_1140A":
+                    active_overdue_amt_gt0_exprs.append(base.fill_null(0) > 0)
+                if col == "pmts_overdue_1152A":
+                    closed_overdue_amt_gt0_exprs.append(base.fill_null(0) > 0)
         if overdue_flags:
             contract_aggs.append(
                 pl.any_horizontal(overdue_flags).max().cast(pl.Int8).alias(f"{group}__contract__has_overdue")
             )
         else:
             contract_aggs.append(pl.lit(None).cast(pl.Int8).alias(f"{group}__contract__has_overdue"))
+        if dpd_gt0_exprs:
+            contract_aggs.extend(
+                [
+                    pl.sum_horizontal([expr.cast(pl.Int32) for expr in dpd_gt0_exprs]).sum().alias(
+                        f"{group}__contract__dpd_gt0_payment_count"
+                    ),
+                    pl.sum_horizontal([expr.cast(pl.Int32) for expr in dpd_gt30_exprs]).sum().alias(
+                        f"{group}__contract__dpd_gt30_payment_count"
+                    ),
+                    pl.sum_horizontal([expr.cast(pl.Int32) for expr in dpd_gt60_exprs]).sum().alias(
+                        f"{group}__contract__dpd_gt60_payment_count"
+                    ),
+                    pl.sum_horizontal([expr.cast(pl.Int32) for expr in dpd_gt90_exprs]).sum().alias(
+                        f"{group}__contract__dpd_gt90_payment_count"
+                    ),
+                    pl.any_horizontal(dpd_gt30_exprs).max().cast(pl.Int8).alias(
+                        f"{group}__contract__has_dpd_gt30"
+                    ),
+                    pl.any_horizontal(dpd_gt60_exprs).max().cast(pl.Int8).alias(
+                        f"{group}__contract__has_dpd_gt60"
+                    ),
+                    pl.any_horizontal(dpd_gt90_exprs).max().cast(pl.Int8).alias(
+                        f"{group}__contract__has_dpd_gt90"
+                    ),
+                ]
+            )
+        if overdue_amt_gt0_exprs:
+            contract_aggs.append(
+                pl.sum_horizontal([expr.cast(pl.Int32) for expr in overdue_amt_gt0_exprs]).sum().alias(
+                    f"{group}__contract__overdue_amt_gt0_payment_count"
+                )
+            )
+        if active_payment_exprs:
+            active_payment_flag = pl.any_horizontal(active_payment_exprs)
+            contract_aggs.extend(
+                [
+                    active_payment_flag.cast(pl.Int32).sum().alias(
+                        f"{group}__contract__active_payment_count"
+                    ),
+                    active_payment_flag.max().cast(pl.Int8).alias(f"{group}__contract__has_active_payment"),
+                ]
+            )
+        if closed_payment_exprs:
+            closed_payment_flag = pl.any_horizontal(closed_payment_exprs)
+            contract_aggs.extend(
+                [
+                    closed_payment_flag.cast(pl.Int32).sum().alias(
+                        f"{group}__contract__closed_payment_count"
+                    ),
+                    closed_payment_flag.max().cast(pl.Int8).alias(f"{group}__contract__has_closed_payment"),
+                ]
+            )
+        if active_dpd_gt30_exprs:
+            contract_aggs.append(
+                pl.sum_horizontal([expr.cast(pl.Int32) for expr in active_dpd_gt30_exprs]).sum().alias(
+                    f"{group}__contract__active_dpd_gt30_payment_count"
+                )
+            )
+        if closed_dpd_gt30_exprs:
+            contract_aggs.append(
+                pl.sum_horizontal([expr.cast(pl.Int32) for expr in closed_dpd_gt30_exprs]).sum().alias(
+                    f"{group}__contract__closed_dpd_gt30_payment_count"
+                )
+            )
+        if active_overdue_amt_gt0_exprs:
+            contract_aggs.append(
+                pl.sum_horizontal([expr.cast(pl.Int32) for expr in active_overdue_amt_gt0_exprs]).sum().alias(
+                    f"{group}__contract__active_overdue_amt_gt0_payment_count"
+                )
+            )
+        if closed_overdue_amt_gt0_exprs:
+            contract_aggs.append(
+                pl.sum_horizontal([expr.cast(pl.Int32) for expr in closed_overdue_amt_gt0_exprs]).sum().alias(
+                    f"{group}__contract__closed_overdue_amt_gt0_payment_count"
+                )
+            )
+        if {"pmts_year_1139T", "pmts_month_158T"}.issubset(available):
+            active_period = (
+                pl.col("pmts_year_1139T").cast(pl.Float64, strict=False) * 12
+                + pl.col("pmts_month_158T").cast(pl.Float64, strict=False)
+            )
+            active_bad = pl.col("pmts_dpd_1073P").cast(pl.Float64, strict=False).fill_null(0) > 30
+            contract_aggs.extend(
+                [
+                    active_period.max().alias(f"{group}__contract__active_period_max"),
+                    active_period.min().alias(f"{group}__contract__active_period_min"),
+                    (active_period.max() - active_period.min()).alias(f"{group}__contract__active_period_span"),
+                    pl.when(active_bad).then(active_period).otherwise(None).max().alias(
+                        f"{group}__contract__active_dpd_gt30_period_max"
+                    ),
+                ]
+            )
+        if {"pmts_year_507T", "pmts_month_706T"}.issubset(available):
+            closed_period = (
+                pl.col("pmts_year_507T").cast(pl.Float64, strict=False) * 12
+                + pl.col("pmts_month_706T").cast(pl.Float64, strict=False)
+            )
+            closed_bad = pl.col("pmts_dpd_303P").cast(pl.Float64, strict=False).fill_null(0) > 30
+            contract_aggs.extend(
+                [
+                    closed_period.max().alias(f"{group}__contract__closed_period_max"),
+                    closed_period.min().alias(f"{group}__contract__closed_period_min"),
+                    (closed_period.max() - closed_period.min()).alias(f"{group}__contract__closed_period_span"),
+                    pl.when(closed_bad).then(closed_period).otherwise(None).max().alias(
+                        f"{group}__contract__closed_dpd_gt30_period_max"
+                    ),
+                ]
+            )
 
         contracts = lf.group_by(["case_id", "num_group1"]).agg(contract_aggs).collect(engine="streaming")
         contract_path = contract_dir / f"{split}_{group}_contract_partial_{idx}.parquet"
@@ -456,6 +761,41 @@ def aggregate_large_group_twostage_eager(
                 f"{group}__case_partial__overdue_contract_count"
             ),
         ]
+        semantic_contract_cols = [
+            "dpd_gt0_payment_count",
+            "dpd_gt30_payment_count",
+            "dpd_gt60_payment_count",
+            "dpd_gt90_payment_count",
+            "overdue_amt_gt0_payment_count",
+            "has_dpd_gt30",
+            "has_dpd_gt60",
+            "has_dpd_gt90",
+            "active_payment_count",
+            "closed_payment_count",
+            "has_active_payment",
+            "has_closed_payment",
+            "active_dpd_gt30_payment_count",
+            "closed_dpd_gt30_payment_count",
+            "active_overdue_amt_gt0_payment_count",
+            "closed_overdue_amt_gt0_payment_count",
+            "active_period_max",
+            "active_period_min",
+            "active_period_span",
+            "active_dpd_gt30_period_max",
+            "closed_period_max",
+            "closed_period_min",
+            "closed_period_span",
+            "closed_dpd_gt30_period_max",
+        ]
+        for suffix in semantic_contract_cols:
+            contract_col = f"{group}__contract__{suffix}"
+            if contract_col in contract_schema:
+                if suffix.endswith("_period_max") or suffix.endswith("_period_span"):
+                    case_aggs.append(pl.col(contract_col).max().alias(f"{group}__case_partial__{suffix}_max"))
+                elif suffix.endswith("_period_min"):
+                    case_aggs.append(pl.col(contract_col).min().alias(f"{group}__case_partial__{suffix}_min"))
+                else:
+                    case_aggs.append(pl.col(contract_col).sum().alias(f"{group}__case_partial__{suffix}_sum"))
         for col in selected:
             prefix = f"{group}__contract__{col}"
             sum_col = f"{prefix}__sum"
@@ -485,6 +825,7 @@ def aggregate_large_group_twostage_eager(
         case_path = case_dir / f"{split}_{group}_case_partial_{idx}.parquet"
         case_partial.write_parquet(case_path)
         case_paths.append(case_path)
+        contract_path.unlink(missing_ok=True)
         del case_partial, contract_lf
 
     case_lf = pl.scan_parquet([str(path) for path in case_paths])
@@ -500,6 +841,42 @@ def aggregate_large_group_twostage_eager(
             f"{group}__overdue_contract_count"
         ),
     ]
+    semantic_case_cols = [
+        "dpd_gt0_payment_count",
+        "dpd_gt30_payment_count",
+        "dpd_gt60_payment_count",
+        "dpd_gt90_payment_count",
+        "overdue_amt_gt0_payment_count",
+        "has_dpd_gt30",
+        "has_dpd_gt60",
+        "has_dpd_gt90",
+        "active_payment_count",
+        "closed_payment_count",
+        "has_active_payment",
+        "has_closed_payment",
+        "active_dpd_gt30_payment_count",
+        "closed_dpd_gt30_payment_count",
+        "active_overdue_amt_gt0_payment_count",
+        "closed_overdue_amt_gt0_payment_count",
+        "active_period_max",
+        "active_period_min",
+        "active_period_span",
+        "active_dpd_gt30_period_max",
+        "closed_period_max",
+        "closed_period_min",
+        "closed_period_span",
+        "closed_dpd_gt30_period_max",
+    ]
+    for suffix in semantic_case_cols:
+        sum_col = f"{group}__case_partial__{suffix}_sum"
+        max_col = f"{group}__case_partial__{suffix}_max"
+        min_col = f"{group}__case_partial__{suffix}_min"
+        if sum_col in case_schema:
+            final_aggs.append(pl.col(sum_col).sum().alias(f"{group}__{suffix}"))
+        elif max_col in case_schema:
+            final_aggs.append(pl.col(max_col).max().alias(f"{group}__{suffix}"))
+        elif min_col in case_schema:
+            final_aggs.append(pl.col(min_col).min().alias(f"{group}__{suffix}"))
     for col in selected:
         out = f"{group}__{col}"
         sum_col = f"{out}__sum_sum"
@@ -595,7 +972,27 @@ def feature_set_components(feature_set: str) -> set[str]:
     if feature_set == "light1":
         return {"missing", "counts", "ratios", "ranges"}
     components = set(feature_set.split("+"))
-    allowed = {"missing", "counts", "ratios", "ranges", "ranges_stable", "last", "a2_twostage"}
+    allowed = {
+        "missing",
+        "counts",
+        "ratios",
+        "ranges",
+        "ranges_stable",
+        "last",
+        "a2_twostage",
+        "a2_delinquency",
+        "a2_delinquency_stable",
+        "a2_payment_mix",
+        "a2_temporal",
+        "a2_dpd30_contract",
+        "table_custom_aggs",
+        "custom_person_aggs",
+        "custom_deposit_debitcard_aggs",
+        "custom_bureau_a1_aggs",
+        "custom_applprev_aggs",
+        "custom_tax_aggs",
+        "custom_other_aggs",
+    }
     unknown = components - allowed
     if unknown:
         raise ValueError(
@@ -641,6 +1038,97 @@ def derived_output_columns(feature_set: str) -> list[str]:
                     f"{prefix}__contract_range_max",
                 ]
             )
+    if "a2_delinquency" in components:
+        group = "credit_bureau_a_2"
+        outputs.extend(
+            [
+                f"{group}__dpd_gt0_payment_count",
+                f"{group}__dpd_gt30_payment_count",
+                f"{group}__dpd_gt60_payment_count",
+                f"{group}__dpd_gt90_payment_count",
+                f"{group}__overdue_amt_gt0_payment_count",
+                f"{group}__has_dpd_gt30",
+                f"{group}__has_dpd_gt60",
+                f"{group}__has_dpd_gt90",
+                "derived__a2_overdue_contract_rate",
+                "derived__a2_dpd_gt0_payment_rate",
+                "derived__a2_dpd_gt30_payment_rate",
+                "derived__a2_dpd_gt60_payment_rate",
+                "derived__a2_dpd_gt90_payment_rate",
+                "derived__a2_overdue_amt_gt0_payment_rate",
+                "derived__a2_dpd_gt30_contract_rate",
+                "derived__a2_dpd_gt60_contract_rate",
+                "derived__a2_dpd_gt90_contract_rate",
+                "derived__a2_payment_per_contract",
+            ]
+        )
+    if "a2_delinquency_stable" in components:
+        group = "credit_bureau_a_2"
+        outputs.extend(
+            [
+                f"{group}__has_dpd_gt30",
+                f"{group}__has_dpd_gt60",
+                f"{group}__has_dpd_gt90",
+                f"{group}__dpd_gt30_payment_count",
+                f"{group}__dpd_gt60_payment_count",
+                f"{group}__dpd_gt90_payment_count",
+                "derived__a2_dpd_gt30_contract_rate",
+                "derived__a2_dpd_gt60_contract_rate",
+                "derived__a2_dpd_gt90_contract_rate",
+                "derived__a2_payment_per_contract",
+            ]
+        )
+    if "a2_dpd30_contract" in components:
+        group = "credit_bureau_a_2"
+        outputs.extend(
+            [
+                f"{group}__has_dpd_gt30",
+                "derived__a2_dpd_gt30_contract_rate",
+            ]
+        )
+    if "a2_payment_mix" in components:
+        group = "credit_bureau_a_2"
+        outputs.extend(
+            [
+                f"{group}__active_payment_count",
+                f"{group}__closed_payment_count",
+                f"{group}__has_active_payment",
+                f"{group}__has_closed_payment",
+                f"{group}__active_dpd_gt30_payment_count",
+                f"{group}__closed_dpd_gt30_payment_count",
+                f"{group}__active_overdue_amt_gt0_payment_count",
+                f"{group}__closed_overdue_amt_gt0_payment_count",
+                "derived__a2_active_payment_share",
+                "derived__a2_closed_payment_share",
+                "derived__a2_active_contract_rate",
+                "derived__a2_closed_contract_rate",
+                "derived__a2_active_dpd_gt30_payment_rate",
+                "derived__a2_closed_dpd_gt30_payment_rate",
+                "derived__a2_active_overdue_amt_gt0_payment_rate",
+                "derived__a2_closed_overdue_amt_gt0_payment_rate",
+                "derived__a2_active_minus_closed_dpd_gt30_rate",
+                "derived__a2_active_minus_closed_overdue_amt_rate",
+            ]
+        )
+    if "a2_temporal" in components:
+        group = "credit_bureau_a_2"
+        outputs.extend(
+            [
+                f"{group}__active_period_max",
+                f"{group}__active_period_min",
+                f"{group}__active_period_span",
+                f"{group}__active_dpd_gt30_period_max",
+                f"{group}__closed_period_max",
+                f"{group}__closed_period_min",
+                f"{group}__closed_period_span",
+                f"{group}__closed_dpd_gt30_period_max",
+                "derived__a2_active_period_span_ratio",
+                "derived__a2_closed_period_span_ratio",
+                "derived__a2_active_closed_latest_period_delta",
+                "derived__a2_active_bad_latest_period_gap",
+                "derived__a2_closed_bad_latest_period_gap",
+            ]
+        )
     return outputs
 
 
@@ -733,6 +1221,165 @@ def apply_derived_features(df: pl.DataFrame, feature_set: str) -> pl.DataFrame:
                 break
         exprs.extend(range_exprs)
 
+    if (
+        "a2_delinquency" in components
+        or "a2_delinquency_stable" in components
+        or "a2_dpd30_contract" in components
+    ):
+        group = "credit_bureau_a_2"
+        contract_count = f"{group}__contract_count"
+        payment_count = f"{group}__payment_count"
+        if contract_count in df.columns and payment_count in df.columns:
+            if "a2_delinquency" in components:
+                exprs.append(
+                    _safe_ratio_expr(
+                        f"{group}__overdue_contract_count",
+                        contract_count,
+                        "derived__a2_overdue_contract_rate",
+                    )
+                )
+            if "a2_dpd30_contract" not in components:
+                exprs.append(_safe_ratio_expr(payment_count, contract_count, "derived__a2_payment_per_contract"))
+            for threshold in ("30", "60", "90"):
+                if "a2_dpd30_contract" in components and threshold != "30":
+                    continue
+                count_col = f"{group}__has_dpd_gt{threshold}"
+                if count_col in df.columns:
+                    exprs.append(
+                        _safe_ratio_expr(count_col, contract_count, f"derived__a2_dpd_gt{threshold}_contract_rate")
+                    )
+        if "a2_delinquency" in components and payment_count in df.columns:
+            count_pairs = [
+                (f"{group}__dpd_gt0_payment_count", "derived__a2_dpd_gt0_payment_rate"),
+                (f"{group}__dpd_gt30_payment_count", "derived__a2_dpd_gt30_payment_rate"),
+                (f"{group}__dpd_gt60_payment_count", "derived__a2_dpd_gt60_payment_rate"),
+                (f"{group}__dpd_gt90_payment_count", "derived__a2_dpd_gt90_payment_rate"),
+                (f"{group}__overdue_amt_gt0_payment_count", "derived__a2_overdue_amt_gt0_payment_rate"),
+            ]
+            for count_col, alias in count_pairs:
+                if count_col in df.columns:
+                    exprs.append(_safe_ratio_expr(count_col, payment_count, alias))
+
+    if "a2_payment_mix" in components:
+        group = "credit_bureau_a_2"
+        contract_count = f"{group}__contract_count"
+        payment_count = f"{group}__payment_count"
+        active_payment_count = f"{group}__active_payment_count"
+        closed_payment_count = f"{group}__closed_payment_count"
+        if payment_count in df.columns:
+            for count_col, alias in [
+                (active_payment_count, "derived__a2_active_payment_share"),
+                (closed_payment_count, "derived__a2_closed_payment_share"),
+            ]:
+                if count_col in df.columns:
+                    exprs.append(_safe_ratio_expr(count_col, payment_count, alias))
+        if contract_count in df.columns:
+            for count_col, alias in [
+                (f"{group}__has_active_payment", "derived__a2_active_contract_rate"),
+                (f"{group}__has_closed_payment", "derived__a2_closed_contract_rate"),
+            ]:
+                if count_col in df.columns:
+                    exprs.append(_safe_ratio_expr(count_col, contract_count, alias))
+        rate_specs = [
+            (
+                f"{group}__active_dpd_gt30_payment_count",
+                active_payment_count,
+                "derived__a2_active_dpd_gt30_payment_rate",
+            ),
+            (
+                f"{group}__closed_dpd_gt30_payment_count",
+                closed_payment_count,
+                "derived__a2_closed_dpd_gt30_payment_rate",
+            ),
+            (
+                f"{group}__active_overdue_amt_gt0_payment_count",
+                active_payment_count,
+                "derived__a2_active_overdue_amt_gt0_payment_rate",
+            ),
+            (
+                f"{group}__closed_overdue_amt_gt0_payment_count",
+                closed_payment_count,
+                "derived__a2_closed_overdue_amt_gt0_payment_rate",
+            ),
+        ]
+        for count_col, denom_col, alias in rate_specs:
+            if count_col in df.columns and denom_col in df.columns:
+                exprs.append(_safe_ratio_expr(count_col, denom_col, alias))
+        if (
+            f"{group}__active_dpd_gt30_payment_count" in df.columns
+            and active_payment_count in df.columns
+            and f"{group}__closed_dpd_gt30_payment_count" in df.columns
+            and closed_payment_count in df.columns
+        ):
+            active_rate = _safe_div(
+                pl.col(f"{group}__active_dpd_gt30_payment_count").cast(pl.Float64, strict=False),
+                pl.col(active_payment_count).cast(pl.Float64, strict=False),
+            )
+            closed_rate = _safe_div(
+                pl.col(f"{group}__closed_dpd_gt30_payment_count").cast(pl.Float64, strict=False),
+                pl.col(closed_payment_count).cast(pl.Float64, strict=False),
+            )
+            exprs.append(
+                (active_rate.fill_null(0) - closed_rate.fill_null(0)).alias(
+                    "derived__a2_active_minus_closed_dpd_gt30_rate"
+                )
+            )
+        if (
+            f"{group}__active_overdue_amt_gt0_payment_count" in df.columns
+            and active_payment_count in df.columns
+            and f"{group}__closed_overdue_amt_gt0_payment_count" in df.columns
+            and closed_payment_count in df.columns
+        ):
+            active_rate = _safe_div(
+                pl.col(f"{group}__active_overdue_amt_gt0_payment_count").cast(pl.Float64, strict=False),
+                pl.col(active_payment_count).cast(pl.Float64, strict=False),
+            )
+            closed_rate = _safe_div(
+                pl.col(f"{group}__closed_overdue_amt_gt0_payment_count").cast(pl.Float64, strict=False),
+                pl.col(closed_payment_count).cast(pl.Float64, strict=False),
+            )
+            exprs.append(
+                (active_rate.fill_null(0) - closed_rate.fill_null(0)).alias(
+                    "derived__a2_active_minus_closed_overdue_amt_rate"
+                )
+            )
+
+    if "a2_temporal" in components:
+        group = "credit_bureau_a_2"
+        active_span = f"{group}__active_period_span"
+        active_max = f"{group}__active_period_max"
+        active_min = f"{group}__active_period_min"
+        active_bad_max = f"{group}__active_dpd_gt30_period_max"
+        closed_span = f"{group}__closed_period_span"
+        closed_max = f"{group}__closed_period_max"
+        closed_min = f"{group}__closed_period_min"
+        closed_bad_max = f"{group}__closed_dpd_gt30_period_max"
+        if active_span in df.columns and active_max in df.columns and active_min in df.columns:
+            exprs.append(_safe_ratio_expr(active_span, active_max, "derived__a2_active_period_span_ratio"))
+        if closed_span in df.columns and closed_max in df.columns and closed_min in df.columns:
+            exprs.append(_safe_ratio_expr(closed_span, closed_max, "derived__a2_closed_period_span_ratio"))
+        if active_max in df.columns and closed_max in df.columns:
+            exprs.append(
+                (
+                    pl.col(active_max).cast(pl.Float64, strict=False)
+                    - pl.col(closed_max).cast(pl.Float64, strict=False)
+                ).alias("derived__a2_active_closed_latest_period_delta")
+            )
+        if active_max in df.columns and active_bad_max in df.columns:
+            exprs.append(
+                (
+                    pl.col(active_max).cast(pl.Float64, strict=False)
+                    - pl.col(active_bad_max).cast(pl.Float64, strict=False)
+                ).alias("derived__a2_active_bad_latest_period_gap")
+            )
+        if closed_max in df.columns and closed_bad_max in df.columns:
+            exprs.append(
+                (
+                    pl.col(closed_max).cast(pl.Float64, strict=False)
+                    - pl.col(closed_bad_max).cast(pl.Float64, strict=False)
+                ).alias("derived__a2_closed_bad_latest_period_gap")
+            )
+
     return df.with_columns(exprs) if exprs else df
 
 
@@ -760,10 +1407,20 @@ def build_features(
     if sample_rows:
         lf = lf.sort("case_id").head(sample_rows)
     case_ids = lf.select("case_id")
+    decision_dates = lf.select(
+        [
+            "case_id",
+            pl.col("date_decision").cast(pl.Float64, strict=False).alias("__decision_date"),
+        ]
+    )
     for group in preset.depth0_groups:
         lf = lf.join(load_depth0(data_dir, split, group, case_ids), on="case_id", how="left")
     for group in preset.aggregate_groups:
-        lf = lf.join(aggregate_group(data_dir, split, group, case_ids, feature_set), on="case_id", how="left")
+        lf = lf.join(
+            aggregate_group(data_dir, split, group, case_ids, feature_set, decision_dates),
+            on="case_id",
+            how="left",
+        )
     if output_columns is not None:
         wanted = set(required_raw_columns_for_outputs(output_columns, feature_set))
         wanted.update(["case_id", "target", "WEEK_NUM"])
