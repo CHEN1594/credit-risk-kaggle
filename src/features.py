@@ -146,6 +146,14 @@ LITE_LARGE_NUMERIC_COLUMNS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+TWOSTAGE_LARGE_GROUPS = {"credit_bureau_a_2"}
+TWOSTAGE_OVERDUE_COLUMNS = {
+    "pmts_dpd_1073P",
+    "pmts_dpd_303P",
+    "pmts_overdue_1140A",
+    "pmts_overdue_1152A",
+}
+
 
 def split_dir(data_dir: Path, split: str) -> Path:
     return data_dir / "parquet_files" / split
@@ -370,6 +378,158 @@ def aggregate_large_group_lite_eager(
     return partial_lf.group_by("case_id").agg(final_aggs).collect(engine="streaming")
 
 
+def _safe_div(num: pl.Expr, den: pl.Expr) -> pl.Expr:
+    return pl.when(den > 0).then(num / den).otherwise(None)
+
+
+def aggregate_large_group_twostage_eager(
+    data_dir: Path,
+    split: str,
+    group: str,
+    temp_dir: Path,
+    case_ids: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    selected = LITE_LARGE_NUMERIC_COLUMNS[group]
+    contract_dir = temp_dir / "contract_partials"
+    case_dir = temp_dir / "case_partials"
+    contract_dir.mkdir(parents=True, exist_ok=True)
+    case_dir.mkdir(parents=True, exist_ok=True)
+    case_ids_lf = case_ids.lazy() if case_ids is not None else None
+    case_paths: list[Path] = []
+
+    for idx, path in enumerate(files_for_group(data_dir, split, group)):
+        schema = pl.scan_parquet(str(path)).collect_schema()
+        available = [col for col in selected if col in schema]
+        lf = pl.scan_parquet(str(path)).select(["case_id", "num_group1", "num_group2", *available])
+        lf = lf.with_columns(
+            [
+                pl.col("case_id").cast(pl.Int64),
+                pl.col("num_group1").cast(pl.Int64, strict=False),
+                pl.col("num_group2").cast(pl.Int64, strict=False),
+            ]
+        )
+        lf = filter_cases(lf, case_ids_lf)
+
+        contract_aggs: list[pl.Expr] = [
+            pl.len().alias(f"{group}__contract__payment_count"),
+            pl.col("num_group2").count().alias(f"{group}__contract__num_group2_count"),
+            pl.col("num_group2").max().alias(f"{group}__contract__num_group2_max"),
+            pl.col("num_group2").min().alias(f"{group}__contract__num_group2_min"),
+        ]
+        overdue_flags: list[pl.Expr] = []
+        for col in available:
+            base = pl.col(col).cast(pl.Float64, strict=False)
+            prefix = f"{group}__contract__{col}"
+            contract_aggs.extend(
+                [
+                    base.sum().alias(f"{prefix}__sum"),
+                    base.count().alias(f"{prefix}__count"),
+                    base.mean().alias(f"{prefix}__mean"),
+                    base.max().alias(f"{prefix}__max"),
+                    base.min().alias(f"{prefix}__min"),
+                    base.std().alias(f"{prefix}__std"),
+                    (base.max() - base.min()).alias(f"{prefix}__range"),
+                ]
+            )
+            if col in TWOSTAGE_OVERDUE_COLUMNS:
+                overdue_flags.append(base.fill_null(0) > 0)
+        if overdue_flags:
+            contract_aggs.append(
+                pl.any_horizontal(overdue_flags).max().cast(pl.Int8).alias(f"{group}__contract__has_overdue")
+            )
+        else:
+            contract_aggs.append(pl.lit(None).cast(pl.Int8).alias(f"{group}__contract__has_overdue"))
+
+        contracts = lf.group_by(["case_id", "num_group1"]).agg(contract_aggs).collect(engine="streaming")
+        contract_path = contract_dir / f"{split}_{group}_contract_partial_{idx}.parquet"
+        contracts.write_parquet(contract_path)
+        del contracts, lf
+
+        contract_lf = pl.scan_parquet(str(contract_path))
+        contract_schema = contract_lf.collect_schema()
+        case_aggs: list[pl.Expr] = [
+            pl.len().alias(f"{group}__case_partial__contract_count"),
+            pl.col(f"{group}__contract__payment_count").sum().alias(f"{group}__case_partial__payment_count_sum"),
+            pl.col(f"{group}__contract__payment_count").max().alias(f"{group}__case_partial__payment_count_max"),
+            pl.col(f"{group}__contract__payment_count").mean().alias(f"{group}__case_partial__payment_count_mean"),
+            pl.col(f"{group}__contract__has_overdue").sum().alias(
+                f"{group}__case_partial__overdue_contract_count"
+            ),
+        ]
+        for col in selected:
+            prefix = f"{group}__contract__{col}"
+            sum_col = f"{prefix}__sum"
+            count_col = f"{prefix}__count"
+            max_col = f"{prefix}__max"
+            min_col = f"{prefix}__min"
+            mean_col = f"{prefix}__mean"
+            std_col = f"{prefix}__std"
+            range_col = f"{prefix}__range"
+            out = f"{group}__{col}"
+            if sum_col not in contract_schema:
+                continue
+            case_aggs.extend(
+                [
+                    pl.col(sum_col).sum().alias(f"{out}__sum_sum"),
+                    pl.col(count_col).sum().alias(f"{out}__count_sum"),
+                    pl.col(max_col).max().alias(f"{out}__contract_max"),
+                    pl.col(min_col).min().alias(f"{out}__contract_min"),
+                    pl.col(mean_col).mean().alias(f"{out}__contract_mean_mean"),
+                    pl.col(mean_col).max().alias(f"{out}__contract_mean_max"),
+                    pl.col(std_col).mean().alias(f"{out}__contract_std_mean"),
+                    pl.col(range_col).max().alias(f"{out}__contract_range_max"),
+                ]
+            )
+
+        case_partial = contract_lf.group_by("case_id").agg(case_aggs).collect(engine="streaming")
+        case_path = case_dir / f"{split}_{group}_case_partial_{idx}.parquet"
+        case_partial.write_parquet(case_path)
+        case_paths.append(case_path)
+        del case_partial, contract_lf
+
+    case_lf = pl.scan_parquet([str(path) for path in case_paths])
+    case_schema = case_lf.collect_schema()
+    final_aggs: list[pl.Expr] = [
+        pl.col(f"{group}__case_partial__contract_count").sum().alias(f"{group}__contract_count"),
+        pl.col(f"{group}__case_partial__payment_count_sum").sum().alias(f"{group}__payment_count"),
+        pl.col(f"{group}__case_partial__payment_count_max").max().alias(f"{group}__payment_count_contract_max"),
+        pl.col(f"{group}__case_partial__payment_count_mean").mean().alias(
+            f"{group}__payment_count_contract_mean"
+        ),
+        pl.col(f"{group}__case_partial__overdue_contract_count").sum().alias(
+            f"{group}__overdue_contract_count"
+        ),
+    ]
+    for col in selected:
+        out = f"{group}__{col}"
+        sum_col = f"{out}__sum_sum"
+        count_col = f"{out}__count_sum"
+        max_col = f"{out}__contract_max"
+        min_col = f"{out}__contract_min"
+        mean_mean_col = f"{out}__contract_mean_mean"
+        mean_max_col = f"{out}__contract_mean_max"
+        std_mean_col = f"{out}__contract_std_mean"
+        range_max_col = f"{out}__contract_range_max"
+        if sum_col not in case_schema:
+            continue
+        count_sum = pl.col(count_col).sum()
+        final_aggs.extend(
+            [
+                pl.col(sum_col).sum().alias(f"{out}__sum"),
+                count_sum.alias(f"{out}__count"),
+                _safe_div(pl.col(sum_col).sum(), count_sum).alias(f"{out}__mean"),
+                pl.col(max_col).max().alias(f"{out}__max"),
+                pl.col(min_col).min().alias(f"{out}__min"),
+                pl.col(mean_mean_col).mean().alias(f"{out}__contract_mean_mean"),
+                pl.col(mean_max_col).max().alias(f"{out}__contract_mean_max"),
+                pl.col(std_mean_col).mean().alias(f"{out}__contract_std_mean"),
+                pl.col(range_max_col).max().alias(f"{out}__contract_range_max"),
+            ]
+        )
+
+    return case_lf.group_by("case_id").agg(final_aggs).collect(engine="streaming")
+
+
 def _safe_ratio_expr(numerator: str, denominator: str, alias: str) -> pl.Expr:
     den = pl.col(denominator).cast(pl.Float64, strict=False)
     num = pl.col(numerator).cast(pl.Float64, strict=False)
@@ -435,7 +595,7 @@ def feature_set_components(feature_set: str) -> set[str]:
     if feature_set == "light1":
         return {"missing", "counts", "ratios", "ranges"}
     components = set(feature_set.split("+"))
-    allowed = {"missing", "counts", "ratios", "ranges", "ranges_stable", "last"}
+    allowed = {"missing", "counts", "ratios", "ranges", "ranges_stable", "last", "a2_twostage"}
     unknown = components - allowed
     if unknown:
         raise ValueError(
@@ -455,6 +615,32 @@ def derived_output_columns(feature_set: str) -> list[str]:
         outputs.extend(alias for _, _, alias in RATIO_PAIRS)
     if "ranges_stable" in components:
         outputs.extend(f"{col[:-5]}__range" for col in STABLE_RANGE_MAX_COLUMNS)
+    if "a2_twostage" in components:
+        group = "credit_bureau_a_2"
+        outputs.extend(
+            [
+                f"{group}__contract_count",
+                f"{group}__payment_count",
+                f"{group}__payment_count_contract_max",
+                f"{group}__payment_count_contract_mean",
+                f"{group}__overdue_contract_count",
+            ]
+        )
+        for col in LITE_LARGE_NUMERIC_COLUMNS[group]:
+            prefix = f"{group}__{col}"
+            outputs.extend(
+                [
+                    f"{prefix}__sum",
+                    f"{prefix}__count",
+                    f"{prefix}__mean",
+                    f"{prefix}__max",
+                    f"{prefix}__min",
+                    f"{prefix}__contract_mean_mean",
+                    f"{prefix}__contract_mean_max",
+                    f"{prefix}__contract_std_mean",
+                    f"{prefix}__contract_range_max",
+                ]
+            )
     return outputs
 
 
@@ -587,14 +773,24 @@ def build_features(
     if preset.lite_large_groups:
         case_ids_df = df.select("case_id")
         temp_root = (cache_path.parent if cache_path is not None else Path("outputs/features")) / "_tmp_lite"
+        components = feature_set_components(feature_set)
         for group in preset.lite_large_groups:
-            lite = aggregate_large_group_lite_eager(
-                data_dir,
-                split,
-                group,
-                temp_root / f"{split}_{group}",
-                case_ids=case_ids_df if sample_rows else None,
-            )
+            if "a2_twostage" in components and group in TWOSTAGE_LARGE_GROUPS:
+                lite = aggregate_large_group_twostage_eager(
+                    data_dir,
+                    split,
+                    group,
+                    temp_root / f"{split}_{group}_twostage",
+                    case_ids=case_ids_df,
+                )
+            else:
+                lite = aggregate_large_group_lite_eager(
+                    data_dir,
+                    split,
+                    group,
+                    temp_root / f"{split}_{group}",
+                    case_ids=case_ids_df if sample_rows else None,
+                )
             df = df.join(lite, on="case_id", how="left")
     df = apply_derived_features(df, feature_set)
     if output_columns is not None:
