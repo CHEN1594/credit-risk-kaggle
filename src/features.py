@@ -166,6 +166,47 @@ TWOSTAGE_CLOSED_COLUMNS = {
     "pmts_year_507T",
 }
 
+EX2_BUREAU_A1_EXTRA_COLUMNS = (
+    "annualeffectiverate_199L",
+    "annualeffectiverate_63L",
+    "contractsum_5085717L",
+    "credlmt_230A",
+    "credlmt_935A",
+    "nominalrate_281L",
+    "nominalrate_498L",
+    "numberofcontrsvalue_258L",
+    "numberofcontrsvalue_358L",
+    "numberofinstls_229L",
+    "numberofinstls_320L",
+    "numberofoutstandinstls_520L",
+    "numberofoutstandinstls_59L",
+    "numberofoverdueinstlmax_1039L",
+    "numberofoverdueinstlmax_1151L",
+    "numberofoverdueinstls_725L",
+    "numberofoverdueinstls_834L",
+)
+EX2_PERSON1_FIRST_COLUMNS = (
+    "empl_employedtotal_800L",
+    "empl_employedfrom_271D",
+    "empl_industry_691L",
+    "familystate_447L",
+    "incometype_1044T",
+    "sex_738L",
+    "housetype_905L",
+    "housingtype_772L",
+    "isreference_387L",
+    "birth_259D",
+)
+EX2_PERSON2_FIRST_LAST_COLUMNS = (
+    "empls_economicalst_849M",
+    "empls_employedfrom_796D",
+    "empls_employer_name_740M",
+)
+
+
+def ex2_relevant_column(col: str) -> bool:
+    return col not in SPECIAL_COLUMNS and (col[-1:] in ("T", "L", "M", "D", "P", "A") or "num_group" in col)
+
 
 def split_dir(data_dir: Path, split: str) -> Path:
     return data_dir / "parquet_files" / split
@@ -260,12 +301,26 @@ def numeric_expr(col: str) -> pl.Expr:
     return pl.col(col).cast(pl.Float64, strict=False)
 
 
-def custom_numeric_ops(group: str, col: str, dtype: pl.DataType) -> tuple[str, ...]:
+def custom_numeric_ops(
+    group: str,
+    col: str,
+    dtype: pl.DataType,
+    components: set[str] | None = None,
+) -> tuple[str, ...]:
+    components = components or set()
     family = column_family(col)
     if dtype == pl.Boolean:
         return ("max", "last")
 
     if group.startswith("person_"):
+        if "custom_person_narrow_aggs" in components:
+            if "income" in col.lower():
+                return ("max",)
+            if is_date_column(col):
+                return ("max", "min")
+            if family in {"count_term", "amount"}:
+                return ("max", "min")
+            return ("max",)
         if "income" in col.lower():
             return ("max", "first", "last")
         if is_date_column(col):
@@ -279,9 +334,23 @@ def custom_numeric_ops(group: str, col: str, dtype: pl.DataType) -> tuple[str, .
         return ("first",)
 
     if group.startswith("tax_registry_"):
+        if "custom_tax_narrow_aggs" in components:
+            if family == "amount":
+                return ("max", "min", "mean", "std")
+            if family == "date":
+                return ("max", "min")
+            return ("max", "min")
         return ("max", "min", "first", "last", "mean", "std")
 
     if group == "credit_bureau_a_1":
+        if "custom_bureau_a1_narrow_aggs" in components:
+            if family == "delinquency":
+                return ("max", "mean", "std")
+            if family in {"amount", "rate", "count_term"}:
+                return ("max", "min", "mean", "std")
+            if family == "date":
+                return ("max", "min")
+            return ("max", "min")
         if family in {"amount", "rate", "count_term", "delinquency"}:
             return ("max", "min", "mean", "std", "sum", "median", "first")
         if family == "date":
@@ -289,6 +358,14 @@ def custom_numeric_ops(group: str, col: str, dtype: pl.DataType) -> tuple[str, .
         return ("max", "min")
 
     if group == "applprev_1":
+        if "custom_applprev_narrow_aggs" in components:
+            if family == "delinquency":
+                return ("max", "mean", "std")
+            if family in {"amount", "count_term", "rate"}:
+                return ("max", "min", "mean", "std")
+            if family == "date":
+                return ("max", "min")
+            return ("max", "min")
         if family in {"amount", "count_term", "delinquency"}:
             return ("max", "min", "mean", "std", "sum", "median")
         if family == "date":
@@ -296,9 +373,19 @@ def custom_numeric_ops(group: str, col: str, dtype: pl.DataType) -> tuple[str, .
         return ("max", "min")
 
     if group == "applprev_2":
+        if "custom_applprev_narrow_aggs" in components:
+            return ("nunique",)
         return ("first", "last", "nunique")
 
     if group.startswith("credit_bureau_b_"):
+        if "custom_bureau_b_narrow_aggs" in components:
+            if family == "delinquency":
+                return ("max", "mean", "std")
+            if family in {"amount", "count_term", "rate"}:
+                return ("max", "min", "mean", "std")
+            if family == "date":
+                return ("max", "min")
+            return ("max", "min")
         if family in {"amount", "count_term", "delinquency"}:
             return ("max", "min", "mean", "std", "sum")
         if family == "date":
@@ -308,18 +395,29 @@ def custom_numeric_ops(group: str, col: str, dtype: pl.DataType) -> tuple[str, .
     return ("max", "min")
 
 
-def custom_categorical_ops(group: str, col: str) -> tuple[str, ...]:
+def custom_categorical_ops(group: str, col: str, components: set[str] | None = None) -> tuple[str, ...]:
+    components = components or set()
     if group == "other_1":
         return ("first",)
     if group.startswith("person_"):
+        if "custom_person_narrow_aggs" in components:
+            return ("nunique",)
         return ("first", "last")
     if group in {"deposit_1", "debitcard_1"}:
         return ("first", "last", "nunique")
     if group.startswith("tax_registry_"):
+        if "custom_tax_narrow_aggs" in components:
+            return ("nunique",)
         return ("first", "last", "nunique")
     if group in {"applprev_1", "applprev_2"}:
+        if "custom_applprev_narrow_aggs" in components:
+            return ("nunique",)
         return ("first", "last", "nunique")
+    if group == "credit_bureau_a_1" and "custom_bureau_a1_narrow_aggs" in components:
+        return ("nunique",)
     if group.startswith("credit_bureau_a_") or group.startswith("credit_bureau_b_"):
+        if group.startswith("credit_bureau_b_") and "custom_bureau_b_narrow_aggs" in components:
+            return ("nunique",)
         return ("first", "last", "nunique")
     return ("nunique",)
 
@@ -348,18 +446,121 @@ def append_agg_ops(aggs: list[pl.Expr], base: pl.Expr, out: str, ops: tuple[str,
             raise ValueError(f"Unknown aggregation op: {op}")
 
 
+def ex2_base_expr(col: str, schema: pl.Schema) -> pl.Expr:
+    base = numeric_expr(col)
+    if is_date_column(col) and "__decision_date" in schema:
+        return numeric_expr("__decision_date") - base
+    return base
+
+
+def ex2_general_aggs(group: str, schema: pl.Schema, include_extended_la: bool = True) -> list[pl.Expr]:
+    aggs: list[pl.Expr] = []
+    cols = [col for col in schema.names() if ex2_relevant_column(col)]
+    for col in cols:
+        append_agg_ops(aggs, ex2_base_expr(col, schema), f"{group}__{col}", ("max", "min"))
+    if include_extended_la:
+        for col in [col for col in cols if col[-1:] in ("L", "A")]:
+            append_agg_ops(aggs, ex2_base_expr(col, schema), f"{group}__{col}", ("mean", "std", "sum", "median"))
+    return aggs
+
+
+def ex2_aggregate_exprs(group: str, schema: pl.Schema) -> list[pl.Expr]:
+    aggs: list[pl.Expr] = [pl.len().alias(f"{group}__row_count")]
+
+    if group in {"credit_bureau_b_1", "credit_bureau_b_2", "applprev_2"}:
+        return aggs
+
+    if group in {"deposit_1", "debitcard_1"}:
+        for col in [col for col in schema.names() if ex2_relevant_column(col)]:
+            append_agg_ops(aggs, ex2_base_expr(col, schema), f"{group}__{col}", ("max", "min"))
+        return aggs
+
+    if group == "person_1":
+        for col in EX2_PERSON1_FIRST_COLUMNS:
+            if col not in schema:
+                continue
+            base = ex2_base_expr(col, schema) if is_date_column(col) or schema[col].is_numeric() else pl.col(col)
+            append_agg_ops(aggs, base, f"{group}__{col}", ("first",))
+        if "mainoccupationinc_384A" in schema:
+            income = numeric_expr("mainoccupationinc_384A")
+            aggs.append(income.max().alias(f"{group}__mainoccupationinc_384A__max"))
+            if "incometype_1044T" in schema:
+                aggs.append(
+                    income.filter(pl.col("incometype_1044T") == "SELFEMPLOYED").max().alias(
+                        f"{group}__mainoccupationinc_384A__selfemployed_max"
+                    )
+                )
+        return aggs
+
+    if group == "person_2":
+        for col in EX2_PERSON2_FIRST_LAST_COLUMNS:
+            if col not in schema:
+                continue
+            base = ex2_base_expr(col, schema) if is_date_column(col) or schema[col].is_numeric() else pl.col(col)
+            append_agg_ops(aggs, base, f"{group}__{col}", ("first", "last"))
+        return aggs
+
+    if group == "other_1":
+        for col in schema.names():
+            if col in SPECIAL_COLUMNS or "num_group" in col:
+                continue
+            base = numeric_expr(col) if schema[col].is_numeric() or schema[col] == pl.Boolean else pl.col(col)
+            append_agg_ops(aggs, base, f"{group}__{col}", ("first",))
+        return aggs
+
+    if group == "tax_registry_a_1":
+        for col in [col for col in schema.names() if ex2_relevant_column(col)]:
+            append_agg_ops(
+                aggs,
+                ex2_base_expr(col, schema),
+                f"{group}__{col}",
+                ("max", "min", "last", "first", "mean", "std"),
+            )
+        if "amount_4527230A" in schema:
+            amount = numeric_expr("amount_4527230A")
+            aggs.append((amount.max() - amount.min()).alias(f"{group}__amount_4527230A__gap"))
+        return aggs
+
+    if group == "credit_bureau_a_1":
+        for col in [col for col in schema.names() if ex2_relevant_column(col)]:
+            append_agg_ops(aggs, ex2_base_expr(col, schema), f"{group}__{col}", ("max", "min"))
+        for col in EX2_BUREAU_A1_EXTRA_COLUMNS:
+            if col in schema:
+                append_agg_ops(
+                    aggs,
+                    ex2_base_expr(col, schema),
+                    f"{group}__{col}",
+                    ("mean", "std", "sum", "median", "first"),
+                )
+        return aggs
+
+    return aggs + ex2_general_aggs(group, schema)
+
+
 def use_custom_aggs_for_group(components: set[str], group: str) -> bool:
+    if "ex2_data" in components:
+        return True
     if "table_custom_aggs" in components:
         return True
     if "custom_person_aggs" in components and group.startswith("person_"):
+        return True
+    if "custom_person_narrow_aggs" in components and group.startswith("person_"):
         return True
     if "custom_deposit_debitcard_aggs" in components and group in {"deposit_1", "debitcard_1"}:
         return True
     if "custom_bureau_a1_aggs" in components and group == "credit_bureau_a_1":
         return True
+    if "custom_bureau_a1_narrow_aggs" in components and group == "credit_bureau_a_1":
+        return True
     if "custom_applprev_aggs" in components and group.startswith("applprev_"):
         return True
+    if "custom_applprev_narrow_aggs" in components and group.startswith("applprev_"):
+        return True
     if "custom_tax_aggs" in components and group.startswith("tax_registry_"):
+        return True
+    if "custom_tax_narrow_aggs" in components and group.startswith("tax_registry_"):
+        return True
+    if "custom_bureau_b_narrow_aggs" in components and group.startswith("credit_bureau_b_"):
         return True
     if "custom_other_aggs" in components and group == "other_1":
         return True
@@ -407,6 +608,8 @@ def aggregate_group(
         lf = lf.sort(["case_id", "num_group1"])
     elif custom_aggs and "num_group1" in schema:
         lf = lf.sort(["case_id", "num_group1"])
+    if "ex2_data" in components:
+        return lf.group_by("case_id").agg(ex2_aggregate_exprs(group, schema))
     aggs: list[pl.Expr] = [pl.len().alias(f"{group}__row_count")]
 
     for col, dtype in schema.items():
@@ -418,11 +621,19 @@ def aggregate_group(
                 base = numeric_expr(col)
                 if is_date_column(col) and "__decision_date" in schema:
                     base = numeric_expr("__decision_date") - numeric_expr(col)
-                append_agg_ops(aggs, base, out, custom_numeric_ops(group, col, dtype))
+                append_agg_ops(aggs, base, out, custom_numeric_ops(group, col, dtype, components))
                 if group.startswith("tax_registry_") and column_family(col) == "amount":
                     aggs.append((base.max() - base.min()).alias(f"{out}__gap"))
+                if is_date_column(col) and (
+                    "table_custom_aggs" in components
+                    or "custom_bureau_a1_narrow_aggs" in components
+                    or "custom_applprev_narrow_aggs" in components
+                    or "custom_bureau_b_narrow_aggs" in components
+                    or "custom_tax_narrow_aggs" in components
+                ):
+                    aggs.append((base.max() - base.min()).alias(f"{out}__gap"))
             else:
-                append_agg_ops(aggs, pl.col(col), out, custom_categorical_ops(group, col))
+                append_agg_ops(aggs, pl.col(col), out, custom_categorical_ops(group, col, components))
         elif dtype.is_numeric() or dtype == pl.Boolean or col.endswith("D"):
             base = numeric_expr(col)
             append_agg_ops(aggs, base, out, ("mean", "max", "min", "std"))
@@ -987,11 +1198,17 @@ def feature_set_components(feature_set: str) -> set[str]:
         "a2_dpd30_contract",
         "table_custom_aggs",
         "custom_person_aggs",
+        "custom_person_narrow_aggs",
         "custom_deposit_debitcard_aggs",
         "custom_bureau_a1_aggs",
+        "custom_bureau_a1_narrow_aggs",
         "custom_applprev_aggs",
+        "custom_applprev_narrow_aggs",
         "custom_tax_aggs",
+        "custom_tax_narrow_aggs",
+        "custom_bureau_b_narrow_aggs",
         "custom_other_aggs",
+        "ex2_data",
     }
     unknown = components - allowed
     if unknown:

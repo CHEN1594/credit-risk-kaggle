@@ -323,3 +323,67 @@ Kaggle notebook 不能直接 import 本地 `src/`，所以 `scripts/build_notebo
 ## 特征工程的notes
 
 1. 语义出发， 构建有价值的 2. 基础体检 也就是构建前后就需要去看一下这个缺少值啥的， 看看适不适合， 不只是之后要做哦， 构建前也需要哦， 3. 看iv值之类的进行参考。 4.小批量训练看看效果
+
+## 特征工程流程复盘
+
+当前最有效的路线不是盲目堆特征，而是固定验证方式后，按表、按聚合方法、按语义特征组逐步实验。
+
+推荐流程：
+
+```text
+粗 baseline
+-> 固定 CV
+-> 基础清理
+-> 按表做实验
+-> 按聚合方法做实验
+-> 聚合客制化
+-> 语义特征构造
+-> 按组跑 CV
+-> importance / IV / PSI / null importance 辅助筛
+-> 再 CV 确认
+```
+
+各步骤含义：
+
+1. 粗 baseline：先把 base、depth=0、depth=1、depth=2 的多张表全部压到 `case_id` 级别宽表里，保证信息不漏。缺点是很多聚合很粗，比如日期 sum、类别 mean 这类特征业务意义不强。
+2. 固定 CV：固定 fold、模型参数、随机种子、评价指标和训练流程。之后每次只改一个方向，才能判断涨分来自哪里。CV 是本地最终裁判，importance、IV、PSI 都只是辅助。
+3. 基础清理：检查全空列、常量列、重复列、几乎全缺失列、聚合后 `case_id` 是否唯一、train/test 类型是否一致。高缺失不一定直接删，因为风控里“缺失本身”可能有信息，可以保留原特征并额外加 missing flag。
+4. 按表实验：做表级 ablation，例如去掉某一组 `person`、`bureau_a`、`tax_registry`、`deposit/debitcard` 后看 CV 变化。目的是找重点战场。
+5. 按聚合方法实验：看 `sum/max/min/mean/std/first/last/nunique` 哪些有效。不同字段类型不能无脑套同一批聚合。
+6. 聚合客制化：按字段含义设计聚合。金额类适合 mean/max/sum/std，日期类更适合 max/min/last 和相对 `date_decision` 的时间差，类别类更适合 nunique/mode/last/count，逾期类更适合 max/count/ratio/recent。
+7. 语义特征：主动构造业务上代表风险的变量，例如 DPD 阈值次数、逾期金额、还款比例、收入负债比、拒绝/通过比例、active/closed 合同数量、最近行为等。
+8. 按组跑 CV：不要一次性乱加一大坨。按 DPD 组、还款比例组、状态组、最近行为组等分组加入，确认哪一类特征真的有用。
+9. 辅助筛选：用 LightGBM importance 看模型是否使用，用 IV/单变量 AUC 看单特征信号，用 PSI 看 train/test 分布稳定性，用 null importance 筛掉“模型喜欢切但不一定有真实信号”的噪声特征。
+10. 再 CV 确认：任何删除或新增，最后都要重新跑 CV。辅助指标不能直接决定保留，CV 才能决定。
+
+## 当前项目做到哪里了
+
+| 环节 | 状态 | 说明 |
+| --- | --- | --- |
+| 粗 baseline | 已完成 | v5 已把主要表压成 `case_id` 宽表，public LB `0.51820`。 |
+| 固定 CV | 部分完成 | 已有 last-20-week holdout 和 `scripts/cv_features.py` 多窗口 CV；但 v8 出现本地涨、LB 跌，说明 CV 仍需继续校准。 |
+| 基础清理 | 部分完成 | 已做列过滤、类别映射、train/test 对齐、低信息列过滤；重复列、系统 missing flag、高缺失保留策略还没有完全体系化。 |
+| 按表实验 | 部分完成 | v8/v9 已围绕 `bureau_a_1`、`person`、`tax`、`deposit/debitcard` 做过方向实验，但还没有完整的逐表 remove/add ablation。 |
+| 按聚合方法实验 | 部分完成 | 已发现全表统一聚合会产生大量噪声，并尝试过宽/窄聚合；但还没系统跑过“去掉全部 sum/std/first/last”这类方法级实验。 |
+| 聚合客制化 | 已明显推进 | v9 借鉴 example2 的数据处理方式，按表定制聚合，并把日期转成相对 `date_decision` 的时间差；目前 public LB 最好，`0.55357`。 |
+| 语义特征 | 部分完成 | 已尝试 A2 DPD 阈值、overdue、active/closed、时间差等特征；部分方向本地有效但没有稳定超过 v9。后续还可继续做还款比例、状态比例、recent 行为等组。 |
+| 按组 CV | 部分完成 | 已用小样本和多窗口跑过若干组，但还没有形成每一组特征的稳定实验表。 |
+| importance / IV / PSI | 部分完成 | `feature_lab/feature_report.py` 已用于部分 A2 特征体检；但 v9 全量特征还没有系统做 IV/PSI/importance 汇总。 |
+| null importance | 未做 | 成本较高，当前优先级低。等特征工程进入精筛阶段再考虑。 |
+| 再 CV / LB 确认 | 持续进行 | 当前记录：v5 `0.51820`，v6 `0.54247`，v8 `0.53090`，v9 `0.55357`。 |
+
+## 当前最重要结论
+
+目前正式主线应该以 v9 为 baseline。v9 的价值在于：它不是继续堆更多聚合，而是把聚合方式改得更接近字段语义和 example2 的成熟处理方式，所以 LB 明显超过 v5/v6/v8。
+
+下一步优先级：
+
+1. 以 v9 为基线做表级 ablation，确认哪些表和表组贡献最大。
+2. 在 v9 内做聚合方法 ablation，优先删掉业务意义弱、容易过拟合、内存占用高的聚合。
+3. 对 v9 全量特征做 importance / IV / PSI 体检，找高收益和高风险特征。
+4. 在 v9 上按组加入语义特征，例如 DPD 阈值、还款比例、状态比例、recent 行为，每组单独 CV。
+5. 每次只改一个方向，最后用 full holdout 和 Kaggle LB 双重确认。
+
+面试表达可以简化成：
+
+> 我先把 Home Credit 的多源多深度关系表统一压缩成 `case_id` 级宽表，再固定时间切分 CV，逐步做表级和聚合方法 ablation。后续从暴力聚合改成按表、按字段语义定制聚合，例如金额、日期、类别、逾期字段分别采用不同聚合方式，并用 IV、PSI、feature importance 和时间 CV 辅助筛选，最终以 Kaggle LB 做外部验证。

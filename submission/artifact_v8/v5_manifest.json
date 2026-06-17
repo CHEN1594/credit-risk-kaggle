@@ -1,0 +1,48 @@
+{
+  "version": "v5",
+  "model_kind": "refit_all",
+  "preset": "a2lite",
+  "feature_set": "a2_twostage+custom_bureau_a1_narrow_aggs",
+  "max_missing": 0.7,
+  "max_cat_unique": 200,
+  "use_float16": false,
+  "string_hash_seed": 42,
+  "best_iteration": 1079,
+  "metrics": {
+    "auc": 0.8645309764391212,
+    "gini": 0.7290619528782425,
+    "valid_start_week": 72,
+    "valid_rows": 212203,
+    "train_rows": 1314456,
+    "best_iteration": 1079,
+    "preset": "a2lite",
+    "feature_set": "a2_twostage+custom_bureau_a1_narrow_aggs",
+    "sample_rows": 0,
+    "max_missing": 0.7,
+    "max_cat_unique": 200,
+    "polars_drop_summary": {
+      "missing": 377,
+      "constant": 4,
+      "high_cardinality": 2
+    },
+    "drop_summary": {
+      "missing": 0,
+      "constant": 22,
+      "high_cardinality": 0,
+      "kept": 620
+    },
+    "n_features": 620,
+    "stability": 0.7100228894106246,
+    "mean_gini": 0.724042033278814,
+    "slope": 0.00173900803251178,
+    "falling_rate": 0.0,
+    "residual_std": 0.02803828773637879,
+    "n_weeks": 20.0
+  },
+  "files": {
+    "model": "model.joblib",
+    "preprocess": "preprocess.json",
+    "feature_columns": "feature_columns.json",
+    "selected_polars_columns": "selected_polars_columns.json"
+  }
+}
