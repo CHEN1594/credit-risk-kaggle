@@ -361,7 +361,7 @@ Kaggle notebook 不能直接 import 本地 `src/`，所以 `scripts/build_notebo
 | 环节 | 状态 | 说明 |
 | --- | --- | --- |
 | 粗 baseline | 已完成 | v5 已把主要表压成 `case_id` 宽表，public LB `0.51820`。 |
-| 固定 CV | 部分完成 | 已有 last-20-week holdout 和 `scripts/cv_features.py` 多窗口 CV；但 v8 出现本地涨、LB 跌，说明 CV 仍需继续校准。 |
+| 固定 CV | 已完善第一版 | `scripts/cv_features.py` 已改为严格 5-window expanding CV：每折只用验证窗口之前的周 fit 预处理和训练模型，最后输出 mean/min/std/last20 gini。最终提交训练仍用全部训练周。 |
 | 基础清理 | 部分完成 | 已做列过滤、类别映射、train/test 对齐、低信息列过滤；重复列、系统 missing flag、高缺失保留策略还没有完全体系化。 |
 | 按表实验 | 部分完成 | v8/v9 已围绕 `bureau_a_1`、`person`、`tax`、`deposit/debitcard` 做过方向实验，但还没有完整的逐表 remove/add ablation。 |
 | 按聚合方法实验 | 部分完成 | 已发现全表统一聚合会产生大量噪声，并尝试过宽/窄聚合；但还没系统跑过“去掉全部 sum/std/first/last”这类方法级实验。 |

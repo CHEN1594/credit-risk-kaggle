@@ -21,11 +21,11 @@ from src.preprocess import apply_preprocessor, fit_preprocessor, summarize_drops
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run rolling time-window CV on a filtered feature parquet.")
+    parser = argparse.ArgumentParser(description="Run strict expanding-window CV on a filtered feature parquet.")
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--output-path", type=Path, default=None)
     parser.add_argument("--valid-weeks", type=int, default=20)
-    parser.add_argument("--folds", type=int, default=3)
+    parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--gap-weeks", type=int, default=0)
     parser.add_argument("--n-estimators", type=int, default=900)
     parser.add_argument("--early-stopping-rounds", type=int, default=80)
@@ -65,7 +65,19 @@ def fold_windows(max_week: int, valid_weeks: int, folds: int, gap_weeks: int) ->
             break
         windows.append((valid_start, valid_end))
         end = valid_start - gap_weeks - 1
-    return windows
+    return list(reversed(windows))
+
+
+def metric_summary(values: list[float]) -> dict[str, float]:
+    clean = np.array([value for value in values if not np.isnan(value)], dtype=np.float64)
+    if len(clean) == 0:
+        return {"mean": float("nan"), "min": float("nan"), "max": float("nan"), "std": float("nan")}
+    return {
+        "mean": float(np.mean(clean)),
+        "min": float(np.min(clean)),
+        "max": float(np.max(clean)),
+        "std": float(np.std(clean)),
+    }
 
 
 def main() -> None:
@@ -81,31 +93,35 @@ def main() -> None:
     train_pdf = pd.read_parquet(train_path)
     check_memory("after read train parquet", args.max_rss_gb, args.min_available_gb)
 
-    y = train_pdf["target"].astype("int8")
     weeks = train_pdf["WEEK_NUM"].to_numpy()
     max_week = int(train_pdf["WEEK_NUM"].max())
     windows = fold_windows(max_week, args.valid_weeks, args.folds, args.gap_weeks)
     if not windows:
         raise ValueError("No CV windows could be built.")
 
-    state = fit_preprocessor(
-        train_pdf,
-        max_missing=float(metadata["max_missing"]),
-        max_cat_unique=int(metadata["max_cat_unique"]),
-        use_float16=bool(metadata.get("use_float16", False)),
-    )
-    X = apply_preprocessor(train_pdf, state, use_float16=bool(metadata.get("use_float16", False)))
-    del train_pdf
-    gc.collect()
-    check_memory("after preprocess", args.max_rss_gb, args.min_available_gb)
-
     fold_results = []
     for idx, (valid_start, valid_end) in enumerate(windows, start=1):
         valid_mask = (weeks >= valid_start) & (weeks <= valid_end)
         train_mask = weeks < valid_start
-        X_train, X_valid = X.loc[train_mask], X.loc[valid_mask]
-        y_train, y_valid = y.loc[train_mask], y.loc[valid_mask]
+
+        train_slice = train_pdf.loc[train_mask].copy()
+        valid_slice = train_pdf.loc[valid_mask].copy()
+        y_train = train_slice["target"].astype("int8")
+        y_valid = valid_slice["target"].astype("int8")
         valid_week_values = weeks[valid_mask]
+
+        state = fit_preprocessor(
+            train_slice,
+            max_missing=float(metadata["max_missing"]),
+            max_cat_unique=int(metadata["max_cat_unique"]),
+            use_float16=bool(metadata.get("use_float16", False)),
+        )
+        X_train = apply_preprocessor(train_slice, state, use_float16=bool(metadata.get("use_float16", False)))
+        X_valid = apply_preprocessor(valid_slice, state, use_float16=bool(metadata.get("use_float16", False)))
+        del train_slice, valid_slice
+        gc.collect()
+        check_memory(f"after fold {idx} preprocess", args.max_rss_gb, args.min_available_gb)
+
         model = lgb.LGBMClassifier(**params(args))
         model.fit(
             X_train,
@@ -122,28 +138,58 @@ def main() -> None:
             "train_rows": int(train_mask.sum()),
             "valid_rows": int(valid_mask.sum()),
             "best_iteration": int(model.best_iteration_ or args.n_estimators),
+            "n_features": int(len(state.feature_cols)),
+            "drop_summary": summarize_drops(state),
             "auc": float(roc_auc_score(y_valid, pred)),
             "gini": float(gini_score(y_valid, pred)),
         }
         result.update(stability_metric(y_valid.to_numpy(), pred, valid_week_values))
         fold_results.append(result)
         print(json.dumps(result, indent=2))
-        del model, X_train, X_valid, y_train, y_valid, pred
+        del model, X_train, X_valid, y_train, y_valid, pred, state
         gc.collect()
         check_memory(f"after fold {idx}", args.max_rss_gb, args.min_available_gb)
 
+    last_fold = max(fold_results, key=lambda fold: fold["valid_end_week"])
+    auc_summary = metric_summary([fold["auc"] for fold in fold_results])
+    gini_summary = metric_summary([fold["gini"] for fold in fold_results])
+    stability_summary = metric_summary([fold["stability"] for fold in fold_results])
+    mean_gini_summary = metric_summary([fold["mean_gini"] for fold in fold_results])
     summary = {
         "preset": metadata["preset"],
         "feature_set": metadata.get("feature_set", "none"),
-        "n_features": len(state.feature_cols),
-        "drop_summary": summarize_drops(state),
+        "validation": {
+            "type": "strict_expanding_window",
+            "valid_weeks": args.valid_weeks,
+            "folds_requested": args.folds,
+            "folds_built": len(fold_results),
+            "gap_weeks": args.gap_weeks,
+            "no_time_leakage": "each fold fits preprocessing and model with WEEK_NUM < valid_start_week",
+        },
         "folds": fold_results,
-        "mean_auc": float(np.mean([fold["auc"] for fold in fold_results])),
-        "mean_gini": float(np.mean([fold["gini"] for fold in fold_results])),
-        "mean_stability": float(np.mean([fold["stability"] for fold in fold_results])),
-        "min_stability": float(np.min([fold["stability"] for fold in fold_results])),
+        "auc": auc_summary,
+        "gini": gini_summary,
+        "stability": stability_summary,
+        "weekly_mean_gini": mean_gini_summary,
+        "mean_auc": auc_summary["mean"],
+        "mean_gini": gini_summary["mean"],
+        "min_gini": gini_summary["min"],
+        "std_gini": gini_summary["std"],
+        "mean_stability": stability_summary["mean"],
+        "min_stability": stability_summary["min"],
+        "last20": {
+            "valid_start_week": int(last_fold["valid_start_week"]),
+            "valid_end_week": int(last_fold["valid_end_week"]),
+            "auc": float(last_fold["auc"]),
+            "gini": float(last_fold["gini"]),
+            "stability": float(last_fold["stability"]),
+            "mean_gini": float(last_fold["mean_gini"]),
+        },
+        "last20_gini": float(last_fold["gini"]),
+        "last20_stability": float(last_fold["stability"]),
     }
     output_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    pd.DataFrame(fold_results).to_csv(output_path.with_suffix(".csv"), index=False)
     print(json.dumps(summary, indent=2))
 
 
