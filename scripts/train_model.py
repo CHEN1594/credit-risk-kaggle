@@ -30,6 +30,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-estimators", type=int, default=1800)
     parser.add_argument("--early-stopping-rounds", type=int, default=150)
     parser.add_argument("--use-float16", action="store_true")
+    parser.add_argument(
+        "--missing-indicator-min-rate",
+        type=float,
+        default=None,
+        help="Override metadata and add __is_missing flags for selected columns with at least this missing rate.",
+    )
     parser.add_argument("--max-rss-gb", type=float, default=30.0)
     parser.add_argument("--min-available-gb", type=float, default=8.0)
     parser.add_argument("--seed", type=int, default=42)
@@ -103,6 +109,11 @@ def main() -> None:
         train_pdf,
         max_missing=float(metadata["max_missing"]),
         max_cat_unique=int(metadata["max_cat_unique"]),
+        missing_indicator_min_rate=(
+            args.missing_indicator_min_rate
+            if args.missing_indicator_min_rate is not None
+            else metadata.get("missing_indicator_min_rate")
+        ),
         use_float16=args.use_float16,
     )
     X = apply_preprocessor(train_pdf, state, use_float16=args.use_float16)
@@ -143,6 +154,9 @@ def main() -> None:
         "max_missing": float(metadata["max_missing"]),
         "max_cat_unique": int(metadata["max_cat_unique"]),
         "polars_drop_summary": {key: len(value) for key, value in metadata["polars_drops"].items()},
+        "experiment_drop_summary": {
+            key: len(value) for key, value in metadata.get("experiment_drops", {}).items()
+        },
         "drop_summary": summarize_drops(state),
         "n_features": len(state.feature_cols),
     }
@@ -177,6 +191,7 @@ def main() -> None:
         "category_maps": state.category_maps,
         "fill_values": state.fill_values,
         "dropped_columns": state.dropped_columns,
+        "missing_indicator_cols": state.missing_indicator_cols,
     }
     joblib.dump(final_model, artifact_dir / "model.joblib", compress=3)
     joblib.dump(state_payload, artifact_dir / "preprocess.joblib", compress=3)
@@ -190,8 +205,15 @@ def main() -> None:
         "feature_set": metadata.get("feature_set", "none"),
         "max_missing": float(metadata["max_missing"]),
         "max_cat_unique": int(metadata["max_cat_unique"]),
+        "missing_indicator_min_rate": (
+            args.missing_indicator_min_rate
+            if args.missing_indicator_min_rate is not None
+            else metadata.get("missing_indicator_min_rate")
+        ),
         "use_float16": bool(args.use_float16),
         "string_hash_seed": int(metadata["string_hash_seed"]),
+        "exclude_prefix": metadata.get("exclude_prefix", []),
+        "exclude_agg": metadata.get("exclude_agg", []),
         "best_iteration": int(best_iteration),
         "metrics": metrics,
         "files": {

@@ -1,0 +1,64 @@
+{
+  "version": "v12",
+  "model_kind": "lgbm_xgboost_catboost_oof_blend_refit_all",
+  "preset": "a2lite",
+  "feature_set": "a2_twostage+ex2_data",
+  "max_missing": 0.95,
+  "max_cat_unique": 50,
+  "use_float16": false,
+  "string_hash_seed": 42,
+  "best_iteration": 1799,
+  "metrics": {
+    "auc": 0.8721610258129419,
+    "gini": 0.7443220516258837,
+    "valid_start_week": 72,
+    "valid_rows": 212203,
+    "train_rows": 1314456,
+    "best_iteration": 1799,
+    "preset": "a2lite",
+    "feature_set": "a2_twostage+ex2_data",
+    "sample_rows": 0,
+    "max_missing": 0.95,
+    "max_cat_unique": 50,
+    "polars_drop_summary": {
+      "missing": 12,
+      "constant": 0,
+      "high_cardinality": 0
+    },
+    "drop_summary": {
+      "missing": 0,
+      "constant": 23,
+      "high_cardinality": 0,
+      "kept": 653
+    },
+    "n_features": 653,
+    "stability": 0.7277259628923145,
+    "mean_gini": 0.7407426690586373,
+    "slope": 0.001065408954534593,
+    "falling_rate": 0.0,
+    "residual_std": 0.02603341233264551,
+    "n_weeks": 20.0
+  },
+  "files": {
+    "model": "model.joblib",
+    "preprocess": "preprocess.json",
+    "feature_columns": "feature_columns.json",
+    "selected_polars_columns": "selected_polars_columns.json",
+    "lightgbm_model": "model.joblib",
+    "xgboost_model": "xgboost_model.joblib",
+    "catboost_model": "catboost_model.joblib"
+  },
+  "blend": {
+    "lightgbm_weight": 0.3,
+    "xgboost_weight": 0.6,
+    "catboost_weight": 0.1,
+    "rationale": "V12: OOF grid search on strict expanding-window predictions selected LGB 0.30 / XGB 0.60 / Cat 0.10."
+  },
+  "catboost": {
+    "model": "catboost_model.joblib",
+    "iterations": 900,
+    "learning_rate": 0.035,
+    "depth": 8,
+    "cv_reference": "outputs/experiments_v9_full/cv5_catboost_ex2_data_full.json"
+  }
+}

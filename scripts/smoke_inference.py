@@ -47,6 +47,7 @@ def main() -> None:
         category_maps=preprocess_payload["category_maps"],
         fill_values=preprocess_payload["fill_values"],
         dropped_columns=preprocess_payload["dropped_columns"],
+        missing_indicator_cols=preprocess_payload.get("missing_indicator_cols", {}),
     )
     sample_submission = pd.read_csv(args.data_dir / "sample_submission.csv")
 
@@ -68,7 +69,23 @@ def main() -> None:
     gc.collect()
     check_memory("after write selected test parquet", args.max_rss_gb, args.min_available_gb)
 
-    model = joblib.load(args.artifact_dir / manifest["files"]["model"])
+    files = manifest["files"]
+    blend = manifest.get("blend", {})
+    lightgbm_weight = float(blend.get("lightgbm_weight", 1.0))
+    xgboost_weight = float(blend.get("xgboost_weight", 0.0))
+    catboost_weight = float(blend.get("catboost_weight", 0.0))
+    lightgbm_model = joblib.load(args.artifact_dir / files.get("lightgbm_model", files["model"]))
+    xgboost_model = None
+    catboost_model = None
+    if "xgboost_model" in files and (args.artifact_dir / files["xgboost_model"]).exists():
+        xgboost_model = joblib.load(args.artifact_dir / files["xgboost_model"])
+    if "catboost_model" in files and (args.artifact_dir / files["catboost_model"]).exists():
+        catboost_model = joblib.load(args.artifact_dir / files["catboost_model"])
+    weight_total = lightgbm_weight
+    if xgboost_model is not None:
+        weight_total += xgboost_weight
+    if catboost_model is not None:
+        weight_total += catboost_weight
     pred_chunks = []
     id_chunks = []
     parquet_file = pq.ParquetFile(test_path)
@@ -76,7 +93,12 @@ def main() -> None:
         batch_pdf = batch.to_pandas()
         id_chunks.append(batch_pdf["case_id"].to_numpy())
         X_batch = apply_preprocessor(batch_pdf, state, use_float16=bool(manifest.get("use_float16", False)))
-        pred_chunks.append(model.predict_proba(X_batch)[:, 1].astype(np.float32))
+        pred = lightgbm_weight * lightgbm_model.predict_proba(X_batch)[:, 1]
+        if xgboost_model is not None:
+            pred = pred + xgboost_weight * xgboost_model.predict_proba(X_batch)[:, 1]
+        if catboost_model is not None:
+            pred = pred + catboost_weight * catboost_model.predict_proba(X_batch)[:, 1]
+        pred_chunks.append((pred / weight_total).astype(np.float32))
         del batch, batch_pdf, X_batch
     predictions = np.concatenate(pred_chunks)
     test_ids = np.concatenate(id_chunks)

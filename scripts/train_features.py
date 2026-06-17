@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import roc_auc_score
 
-from src.feature_filter import filter_polars_columns, hash_string_columns
+from src.feature_filter import drop_experiment_columns, filter_polars_columns, hash_string_columns
 from src.features import PRESETS, build_features, derived_output_columns
 from src.memory import MemoryLimitExceeded, check_memory
 from src.metric import gini_score, stability_metric
@@ -30,12 +30,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--preset", choices=sorted(PRESETS), default="medium")
     parser.add_argument("--feature-set", default="none")
     parser.add_argument("--template-columns", type=Path, default=None)
+    parser.add_argument(
+        "--exclude-prefix",
+        action="append",
+        default=[],
+        help="Drop selected feature columns starting with this prefix after base filtering. Can be repeated.",
+    )
+    parser.add_argument(
+        "--exclude-agg",
+        action="append",
+        default=[],
+        help="Drop selected aggregate columns ending with __AGG, for example sum/std/first/last. Can be repeated.",
+    )
     parser.add_argument("--valid-weeks", type=int, default=20)
     parser.add_argument("--n-estimators", type=int, default=1800)
     parser.add_argument("--early-stopping-rounds", type=int, default=150)
     parser.add_argument("--sample-rows", type=int, default=0)
     parser.add_argument("--max-missing", type=float, default=0.70)
     parser.add_argument("--max-cat-unique", type=int, default=200)
+    parser.add_argument(
+        "--missing-indicator-min-rate",
+        type=float,
+        default=None,
+        help="Add __is_missing flags for selected columns with at least this missing rate. Omit to disable.",
+    )
     parser.add_argument("--use-float16", action="store_true")
     parser.add_argument("--max-rss-gb", type=float, default=30.0)
     parser.add_argument("--min-available-gb", type=float, default=8.0)
@@ -120,6 +138,16 @@ def main() -> None:
     print("polars_drop_summary:", {key: len(value) for key, value in polars_drops.items()})
     guard("after polars filter")
 
+    train_pl, experiment_drops = drop_experiment_columns(
+        train_pl,
+        exclude_prefixes=args.exclude_prefix,
+        exclude_aggs=args.exclude_agg,
+    )
+    if experiment_drops["prefix"] or experiment_drops["agg"]:
+        print("experiment_drop_summary:", {key: len(value) for key, value in experiment_drops.items()})
+        print("after experiment drop shape:", train_pl.shape)
+    guard("after experiment column drop")
+
     train_pl = hash_string_columns(train_pl, seed=args.seed)
     guard("after polars string hash")
 
@@ -132,11 +160,15 @@ def main() -> None:
         "sample_rows": int(args.sample_rows),
         "max_missing": float(args.max_missing),
         "max_cat_unique": int(args.max_cat_unique),
+        "missing_indicator_min_rate": args.missing_indicator_min_rate,
         "use_float16": bool(args.use_float16),
         "string_hash_seed": int(args.seed),
         "selected_polars_columns": selected_polars_cols,
         "template_columns": output_columns,
         "polars_drops": polars_drops,
+        "experiment_drops": experiment_drops,
+        "exclude_prefix": args.exclude_prefix,
+        "exclude_agg": args.exclude_agg,
         "train_filtered_path": str(train_path),
     }
     write_json(run_dir / "feature_metadata.json", feature_metadata)
@@ -162,6 +194,7 @@ def main() -> None:
         train_pdf,
         max_missing=args.max_missing,
         max_cat_unique=args.max_cat_unique,
+        missing_indicator_min_rate=args.missing_indicator_min_rate,
         use_float16=args.use_float16,
     )
     X = apply_preprocessor(train_pdf, state, use_float16=args.use_float16)
@@ -201,6 +234,7 @@ def main() -> None:
         "max_missing": float(args.max_missing),
         "max_cat_unique": int(args.max_cat_unique),
         "polars_drop_summary": {key: len(value) for key, value in polars_drops.items()},
+        "experiment_drop_summary": {key: len(value) for key, value in experiment_drops.items()},
         "drop_summary": summarize_drops(state),
         "n_features": len(state.feature_cols),
     }
@@ -236,6 +270,7 @@ def main() -> None:
         "category_maps": state.category_maps,
         "fill_values": state.fill_values,
         "dropped_columns": state.dropped_columns,
+        "missing_indicator_cols": state.missing_indicator_cols,
     }
     joblib.dump(final_model, artifact_dir / "model.joblib", compress=3)
     joblib.dump(state_payload, artifact_dir / "preprocess.joblib", compress=3)
@@ -249,8 +284,11 @@ def main() -> None:
         "feature_set": args.feature_set,
         "max_missing": float(args.max_missing),
         "max_cat_unique": int(args.max_cat_unique),
+        "missing_indicator_min_rate": args.missing_indicator_min_rate,
         "use_float16": bool(args.use_float16),
         "string_hash_seed": int(args.seed),
+        "exclude_prefix": args.exclude_prefix,
+        "exclude_agg": args.exclude_agg,
         "best_iteration": int(best_iteration),
         "metrics": metrics,
         "files": {

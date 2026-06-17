@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
@@ -13,6 +13,7 @@ class PreprocessState:
     category_maps: dict[str, list[object]]
     fill_values: dict[str, float]
     dropped_columns: dict[str, list[str]]
+    missing_indicator_cols: dict[str, str] = field(default_factory=dict)
 
 
 DROP_ALWAYS = {"case_id", "target"}
@@ -38,6 +39,7 @@ def fit_preprocessor(
     min_unique: int = 2,
     keep_cols: set[str] | None = None,
     use_float16: bool = False,
+    missing_indicator_min_rate: float | None = None,
 ) -> PreprocessState:
     keep_cols = keep_cols or {"WEEK_NUM"}
     candidate_cols = [col for col in df.columns if col not in DROP_ALWAYS]
@@ -47,12 +49,14 @@ def fit_preprocessor(
         "high_cardinality": [],
     }
     selected: list[str] = []
+    missing_rates: dict[str, float] = {}
 
     for col in candidate_cols:
         if col in keep_cols:
             selected.append(col)
             continue
         missing = float(df[col].isna().mean())
+        missing_rates[col] = missing
         if missing > max_missing:
             dropped["missing"].append(col)
             continue
@@ -64,6 +68,19 @@ def fit_preprocessor(
             dropped["high_cardinality"].append(col)
             continue
         selected.append(col)
+
+    missing_indicator_cols: dict[str, str] = {}
+    if missing_indicator_min_rate is not None:
+        for col in list(selected):
+            if col in keep_cols:
+                continue
+            rate = missing_rates.get(col, float(df[col].isna().mean()))
+            if rate >= missing_indicator_min_rate and rate > 0.0:
+                flag_col = f"{col}__is_missing"
+                if flag_col not in df.columns:
+                    df[flag_col] = df[col].isna().astype("int8")
+                selected.append(flag_col)
+                missing_indicator_cols[col] = flag_col
 
     category_maps: dict[str, list[object]] = {}
     fill_values: dict[str, float] = {}
@@ -82,10 +99,18 @@ def fit_preprocessor(
         category_maps=category_maps,
         fill_values=fill_values,
         dropped_columns=dropped,
+        missing_indicator_cols=missing_indicator_cols,
     )
 
 
 def apply_preprocessor(df: pd.DataFrame, state: PreprocessState, use_float16: bool = False) -> pd.DataFrame:
+    for source_col, flag_col in state.missing_indicator_cols.items():
+        if flag_col not in df.columns:
+            if source_col in df.columns:
+                df[flag_col] = df[source_col].isna().astype("int8")
+            else:
+                df[flag_col] = np.ones(len(df), dtype="int8")
+
     missing = [col for col in state.feature_cols if col not in df.columns]
     if missing:
         df = pd.concat([df, pd.DataFrame(np.nan, index=df.index, columns=missing)], axis=1)
@@ -107,4 +132,7 @@ def apply_preprocessor(df: pd.DataFrame, state: PreprocessState, use_float16: bo
 
 
 def summarize_drops(state: PreprocessState) -> dict[str, int]:
-    return {key: len(value) for key, value in state.dropped_columns.items()} | {"kept": len(state.feature_cols)}
+    return {key: len(value) for key, value in state.dropped_columns.items()} | {
+        "kept": len(state.feature_cols),
+        "missing_indicators": len(state.missing_indicator_cols),
+    }

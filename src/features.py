@@ -1209,6 +1209,8 @@ def feature_set_components(feature_set: str) -> set[str]:
         "custom_bureau_b_narrow_aggs",
         "custom_other_aggs",
         "ex2_data",
+        "semantic_v2",
+        "semantic_v2_stable",
     }
     unknown = components - allowed
     if unknown:
@@ -1344,6 +1346,45 @@ def derived_output_columns(feature_set: str) -> list[str]:
                 "derived__a2_active_closed_latest_period_delta",
                 "derived__a2_active_bad_latest_period_gap",
                 "derived__a2_closed_bad_latest_period_gap",
+            ]
+        )
+    if "semantic_v2" in components or "semantic_v2_stable" in components:
+        outputs.extend(
+            [
+                "derived__person_age_years",
+                "derived__bureau_a1_max_dpd",
+                "derived__bureau_a1_overdue_instl_max",
+                "derived__bureau_a1_any_overdue_amount",
+                "derived__bureau_a1_overdue_amount_max",
+                "derived__bureau_a1_overdue_to_outstanding",
+                "derived__bureau_a1_credit_age_span",
+                "derived__prev_max_dpd",
+                "derived__prev_dpd_per_application",
+                "derived__a2_max_dpd",
+                "derived__a2_active_closed_max_dpd_delta",
+                "derived__a2_dpd30_to_dpd0_rate",
+                "derived__a2_dpd90_to_dpd30_rate",
+                "derived__a2_overdue_amount_per_payment",
+                "derived__a2_active_overdue_amount_per_payment",
+            ]
+        )
+    if "semantic_v2" in components:
+        outputs.extend(
+            [
+                "derived__income_to_credamount",
+                "derived__annuity_to_income",
+                "derived__currdebt_to_income",
+                "derived__employment_age_ratio",
+                "derived__bureau_a1_outstanding_debt_max",
+                "derived__bureau_a1_debt_to_credit_limit",
+                "derived__bureau_a1_outstanding_to_total_amount",
+                "derived__bureau_a1_recent_update_gap",
+                "derived__prev_credit_mean_to_current",
+                "derived__prev_credit_max_to_current",
+                "derived__prev_annuity_max_to_current",
+                "derived__prev_debt_max_to_credit_max",
+                "derived__prev_downpmt_max_to_credit_max",
+                "derived__a2_closed_overdue_amount_per_payment",
             ]
         )
     return outputs
@@ -1595,6 +1636,185 @@ def apply_derived_features(df: pl.DataFrame, feature_set: str) -> pl.DataFrame:
                     pl.col(closed_max).cast(pl.Float64, strict=False)
                     - pl.col(closed_bad_max).cast(pl.Float64, strict=False)
                 ).alias("derived__a2_closed_bad_latest_period_gap")
+            )
+
+    if "semantic_v2" in components or "semantic_v2_stable" in components:
+        semantic_full = "semantic_v2" in components
+
+        def numeric_col(name: str) -> pl.Expr:
+            return pl.col(name).cast(pl.Float64, strict=False)
+
+        def add_ratio(numerator: str, denominator: str, alias: str) -> None:
+            if numerator in df.columns and denominator in df.columns:
+                exprs.append(_safe_ratio_expr(numerator, denominator, alias))
+
+        def add_horizontal_max(cols: list[str], alias: str) -> None:
+            available = [col for col in cols if col in df.columns]
+            if available:
+                exprs.append(pl.max_horizontal([numeric_col(col) for col in available]).alias(alias))
+
+        def add_horizontal_min(cols: list[str], alias: str) -> None:
+            available = [col for col in cols if col in df.columns]
+            if available:
+                exprs.append(pl.min_horizontal([numeric_col(col) for col in available]).alias(alias))
+
+        if semantic_full:
+            add_ratio("person_1__mainoccupationinc_384A__max", "credamount_770A", "derived__income_to_credamount")
+            add_ratio("annuity_780A", "person_1__mainoccupationinc_384A__max", "derived__annuity_to_income")
+            add_ratio("currdebt_22A", "person_1__mainoccupationinc_384A__max", "derived__currdebt_to_income")
+        if "person_1__birth_259D__first" in df.columns:
+            age_days = numeric_col("person_1__birth_259D__first")
+            exprs.append((age_days / 365.25).alias("derived__person_age_years"))
+            if semantic_full and "person_1__empl_employedtotal_800L__first" in df.columns:
+                exprs.append(
+                    _safe_div(numeric_col("person_1__empl_employedtotal_800L__first"), age_days).alias(
+                        "derived__employment_age_ratio"
+                    )
+                )
+
+        bureau_dpd_cols = [
+            "credit_bureau_a_1__dpdmax_139P__max",
+            "credit_bureau_a_1__dpdmax_757P__max",
+        ]
+        bureau_overdue_instl_cols = [
+            "credit_bureau_a_1__numberofoverdueinstlmax_1039L__max",
+            "credit_bureau_a_1__numberofoverdueinstlmax_1151L__max",
+            "credit_bureau_a_1__numberofoverdueinstls_725L__max",
+            "credit_bureau_a_1__numberofoverdueinstls_834L__max",
+        ]
+        bureau_overdue_amount_cols = [
+            "credit_bureau_a_1__overdueamountmax_155A__max",
+            "credit_bureau_a_1__overdueamountmax_35A__max",
+            "credit_bureau_a_1__overdueamountmax2_14A__max",
+            "credit_bureau_a_1__overdueamountmax2_398A__max",
+            "credit_bureau_a_1__overdueamount_31A__max",
+            "credit_bureau_a_1__overdueamount_659A__max",
+            "credit_bureau_a_1__debtoverdue_47A__max",
+        ]
+        bureau_outstanding_cols = [
+            "credit_bureau_a_1__outstandingamount_354A__max",
+            "credit_bureau_a_1__outstandingamount_362A__max",
+            "credit_bureau_a_1__totaloutstanddebtvalue_39A__max",
+            "credit_bureau_a_1__totaloutstanddebtvalue_668A__max",
+            "credit_bureau_a_1__debtoutstand_525A__max",
+            "credit_bureau_a_1__residualamount_488A__max",
+            "credit_bureau_a_1__residualamount_856A__max",
+        ]
+        bureau_credit_limit_cols = [
+            "credit_bureau_a_1__credlmt_230A__max",
+            "credit_bureau_a_1__credlmt_935A__max",
+        ]
+        bureau_total_amount_cols = [
+            "credit_bureau_a_1__totalamount_6A__max",
+            "credit_bureau_a_1__totalamount_996A__max",
+            "credit_bureau_a_1__contractsum_5085717L__max",
+        ]
+        add_horizontal_max(bureau_dpd_cols, "derived__bureau_a1_max_dpd")
+        add_horizontal_max(bureau_overdue_instl_cols, "derived__bureau_a1_overdue_instl_max")
+        add_horizontal_max(bureau_overdue_amount_cols, "derived__bureau_a1_overdue_amount_max")
+        if semantic_full:
+            add_horizontal_max(bureau_outstanding_cols, "derived__bureau_a1_outstanding_debt_max")
+        if any(col in df.columns for col in bureau_overdue_amount_cols):
+            overdue_max = pl.max_horizontal([numeric_col(col) for col in bureau_overdue_amount_cols if col in df.columns])
+            exprs.append((overdue_max.fill_null(0) > 0).cast(pl.Int8).alias("derived__bureau_a1_any_overdue_amount"))
+            if any(col in df.columns for col in bureau_outstanding_cols):
+                outstanding_max = pl.max_horizontal([numeric_col(col) for col in bureau_outstanding_cols if col in df.columns])
+                exprs.append(
+                    _safe_div(overdue_max, outstanding_max).alias("derived__bureau_a1_overdue_to_outstanding")
+                )
+        if any(col in df.columns for col in bureau_outstanding_cols) and any(
+            col in df.columns for col in bureau_credit_limit_cols
+        ):
+            outstanding_max = pl.max_horizontal([numeric_col(col) for col in bureau_outstanding_cols if col in df.columns])
+            limit_max = pl.max_horizontal([numeric_col(col) for col in bureau_credit_limit_cols if col in df.columns])
+            if semantic_full:
+                exprs.append(_safe_div(outstanding_max, limit_max).alias("derived__bureau_a1_debt_to_credit_limit"))
+        if semantic_full and any(col in df.columns for col in bureau_outstanding_cols) and any(
+            col in df.columns for col in bureau_total_amount_cols
+        ):
+            outstanding_max = pl.max_horizontal([numeric_col(col) for col in bureau_outstanding_cols if col in df.columns])
+            total_max = pl.max_horizontal([numeric_col(col) for col in bureau_total_amount_cols if col in df.columns])
+            exprs.append(
+                _safe_div(outstanding_max, total_max).alias("derived__bureau_a1_outstanding_to_total_amount")
+            )
+        if semantic_full:
+            add_horizontal_min(
+                [
+                    "credit_bureau_a_1__lastupdate_388D__min",
+                    "credit_bureau_a_1__lastupdate_1112D__min",
+                ],
+                "derived__bureau_a1_recent_update_gap",
+            )
+        for max_col, min_col in [
+            ("credit_bureau_a_1__dateofcredstart_181D__max", "credit_bureau_a_1__dateofcredstart_181D__min"),
+            ("credit_bureau_a_1__dateofcredstart_739D__max", "credit_bureau_a_1__dateofcredstart_739D__min"),
+        ]:
+            if max_col in df.columns and min_col in df.columns:
+                exprs.append((numeric_col(max_col) - numeric_col(min_col)).alias("derived__bureau_a1_credit_age_span"))
+                break
+
+        if semantic_full:
+            add_ratio("applprev_1__credamount_590A__mean", "credamount_770A", "derived__prev_credit_mean_to_current")
+            add_ratio("applprev_1__credamount_590A__max", "credamount_770A", "derived__prev_credit_max_to_current")
+            add_ratio("applprev_1__annuity_853A__max", "annuity_780A", "derived__prev_annuity_max_to_current")
+            add_ratio(
+                "applprev_1__currdebt_94A__max",
+                "applprev_1__credamount_590A__max",
+                "derived__prev_debt_max_to_credit_max",
+            )
+            add_ratio(
+                "applprev_1__downpmt_134A__max",
+                "applprev_1__credamount_590A__max",
+                "derived__prev_downpmt_max_to_credit_max",
+            )
+        add_horizontal_max(
+            [
+                "applprev_1__actualdpd_943P__max",
+                "applprev_1__maxdpdtolerance_577P__max",
+            ],
+            "derived__prev_max_dpd",
+        )
+        if "applprev_1__maxdpdtolerance_577P__max" in df.columns and "applprev_1__row_count" in df.columns:
+            exprs.append(
+                _safe_div(numeric_col("applprev_1__maxdpdtolerance_577P__max"), numeric_col("applprev_1__row_count")).alias(
+                    "derived__prev_dpd_per_application"
+                )
+            )
+
+        add_horizontal_max(
+            [
+                "credit_bureau_a_2__pmts_dpd_1073P__max",
+                "credit_bureau_a_2__pmts_dpd_303P__max",
+            ],
+            "derived__a2_max_dpd",
+        )
+        if "credit_bureau_a_2__pmts_dpd_1073P__max" in df.columns and "credit_bureau_a_2__pmts_dpd_303P__max" in df.columns:
+            exprs.append(
+                (
+                    numeric_col("credit_bureau_a_2__pmts_dpd_1073P__max")
+                    - numeric_col("credit_bureau_a_2__pmts_dpd_303P__max")
+                ).alias("derived__a2_active_closed_max_dpd_delta")
+            )
+        add_ratio("credit_bureau_a_2__dpd_gt30_payment_count", "credit_bureau_a_2__dpd_gt0_payment_count", "derived__a2_dpd30_to_dpd0_rate")
+        add_ratio("credit_bureau_a_2__dpd_gt90_payment_count", "credit_bureau_a_2__dpd_gt30_payment_count", "derived__a2_dpd90_to_dpd30_rate")
+        add_ratio("credit_bureau_a_2__pmts_overdue_1140A__sum", "credit_bureau_a_2__payment_count", "derived__a2_active_overdue_amount_per_payment")
+        if semantic_full:
+            add_ratio(
+                "credit_bureau_a_2__pmts_overdue_1152A__sum",
+                "credit_bureau_a_2__payment_count",
+                "derived__a2_closed_overdue_amount_per_payment",
+            )
+        if (
+            "credit_bureau_a_2__pmts_overdue_1140A__sum" in df.columns
+            and "credit_bureau_a_2__pmts_overdue_1152A__sum" in df.columns
+            and "credit_bureau_a_2__payment_count" in df.columns
+        ):
+            exprs.append(
+                _safe_div(
+                    numeric_col("credit_bureau_a_2__pmts_overdue_1140A__sum")
+                    + numeric_col("credit_bureau_a_2__pmts_overdue_1152A__sum"),
+                    numeric_col("credit_bureau_a_2__payment_count"),
+                ).alias("derived__a2_overdue_amount_per_payment")
             )
 
     return df.with_columns(exprs) if exprs else df

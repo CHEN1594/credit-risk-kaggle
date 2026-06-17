@@ -356,21 +356,163 @@ Kaggle notebook 不能直接 import 本地 `src/`，所以 `scripts/build_notebo
 9. 辅助筛选：用 LightGBM importance 看模型是否使用，用 IV/单变量 AUC 看单特征信号，用 PSI 看 train/test 分布稳定性，用 null importance 筛掉“模型喜欢切但不一定有真实信号”的噪声特征。
 10. 再 CV 确认：任何删除或新增，最后都要重新跑 CV。辅助指标不能直接决定保留，CV 才能决定。
 
-## 当前项目做到哪里了
+## 高手流程 vs 当前实际落地
 
-| 环节 | 状态 | 说明 |
-| --- | --- | --- |
-| 粗 baseline | 已完成 | v5 已把主要表压成 `case_id` 宽表，public LB `0.51820`。 |
-| 固定 CV | 已完善第一版 | `scripts/cv_features.py` 已改为严格 5-window expanding CV：每折只用验证窗口之前的周 fit 预处理和训练模型，最后输出 mean/min/std/last20 gini。最终提交训练仍用全部训练周。 |
-| 基础清理 | 部分完成 | 已做列过滤、类别映射、train/test 对齐、低信息列过滤；重复列、系统 missing flag、高缺失保留策略还没有完全体系化。 |
-| 按表实验 | 部分完成 | v8/v9 已围绕 `bureau_a_1`、`person`、`tax`、`deposit/debitcard` 做过方向实验，但还没有完整的逐表 remove/add ablation。 |
-| 按聚合方法实验 | 部分完成 | 已发现全表统一聚合会产生大量噪声，并尝试过宽/窄聚合；但还没系统跑过“去掉全部 sum/std/first/last”这类方法级实验。 |
-| 聚合客制化 | 已明显推进 | v9 借鉴 example2 的数据处理方式，按表定制聚合，并把日期转成相对 `date_decision` 的时间差；目前 public LB 最好，`0.55357`。 |
-| 语义特征 | 部分完成 | 已尝试 A2 DPD 阈值、overdue、active/closed、时间差等特征；部分方向本地有效但没有稳定超过 v9。后续还可继续做还款比例、状态比例、recent 行为等组。 |
-| 按组 CV | 部分完成 | 已用小样本和多窗口跑过若干组，但还没有形成每一组特征的稳定实验表。 |
-| importance / IV / PSI | 部分完成 | `feature_lab/feature_report.py` 已用于部分 A2 特征体检；但 v9 全量特征还没有系统做 IV/PSI/importance 汇总。 |
-| null importance | 未做 | 成本较高，当前优先级低。等特征工程进入精筛阶段再考虑。 |
-| 再 CV / LB 确认 | 持续进行 | 当前记录：v5 `0.51820`，v6 `0.54247`，v8 `0.53090`，v9 `0.55357`。 |
+| 高手建议的步骤 | 我们实际已经做的 |
+| --- | --- |
+| 粗 baseline：先把所有表的信息压到 `case_id` 级宽表，不追求精细，先保证信息不漏。 | 已完成。v5 把主要 base、depth=0、depth=1、depth=2 表压成 `case_id` 宽表，public LB `0.51820`。 |
+| 固定 CV：固定 fold、模型参数、随机种子、评价指标和训练流程，之后每次只改一个方向。 | 已完善第一版。`scripts/cv_features.py` 已改为严格 5-window expanding CV，每折只用验证窗口之前的周 fit 预处理和训练模型；输出 `mean_gini/min_gini/std_gini/last20_gini`。最终提交训练仍用全部训练周。 |
+| 基础清理：检查全空列、常量列、重复列、高缺失列、join 后 `case_id` 是否唯一、train/test 类型是否一致。 | 已完善第一版。已有列过滤、类别映射、train/test 对齐、低信息列过滤；新增可配置 missing flag；新增 `feature_lab/feature_health.py` 输出缺失率、常量列、疑似重复列、按表/按聚合方法摘要。 |
+| 按表做实验：逐表 remove/add ablation，判断哪些表是真正重点。 | 已具备入口，部分跑过。v8/v9 已围绕 `bureau_a_1`、`person`、`tax`、`deposit/debitcard` 做过方向实验；新增 `scripts/train_features.py --exclude-prefix`，可以系统做逐表 remove ablation。 |
+| 按聚合方法做实验：测试 `sum/max/min/mean/std/first/last/nunique` 哪些有用，哪些只是噪声。 | 已具备入口，部分跑过。已确认全表统一聚合会产生大量噪声；新增 `scripts/train_features.py --exclude-agg sum/std/first/last/...`，可以系统做聚合方法 ablation。 |
+| 聚合客制化：金额、日期、类别、逾期字段分别使用符合业务语义的聚合，而不是所有字段套同一批函数。 | 已明显推进。v9 借鉴 example2 的数据处理方式，按表定制聚合，并把日期转成相对 `date_decision` 的时间差；目前 public LB 最好，`0.55357`。 |
+| 语义特征构造：构造 DPD 阈值、逾期次数、金额比例、状态比例、active/closed、recent 行为等风控特征。 | 部分完成。已尝试 A2 DPD 阈值、overdue、active/closed、时间差等特征；部分方向本地有效但没有稳定超过 v9。后续重点是还款比例、状态比例、recent 行为。 |
+| 按组跑 CV：不要一次性乱加特征，而是按 DPD 组、还款比例组、状态组、recent 组逐组验证。 | 已具备入口。可以用不同 `feature_set` 或 `--exclude-prefix/--exclude-agg` 生成实验版本，再用严格 5-window CV 比较；还需要实际批量跑并沉淀实验表。 |
+| importance / IV / PSI 辅助筛：importance 看模型用不用，IV/单变量 AUC 看单变量信号，PSI 看分布稳定性。 | 已完善第一版。`feature_lab/feature_report.py` 可算 IV/PSI/单变量 AUC；新增 `feature_lab/model_importance_report.py` 合并 LightGBM gain/split importance，适合 v9 全量体检。 |
+| null importance：用随机标签重要性判断某些特征是否只是树模型偏好的噪声。 | 未做。成本较高，当前优先级低；等 v9/v10 特征进入精筛阶段再考虑。 |
+| 再 CV / LB 确认：所有新增或删除最终都必须重新 CV，重要版本再用 Kaggle LB 外部验证。 | 持续进行。当前记录：v5 `0.51820`，v6 `0.54247`，v8 `0.53090`，v9 `0.55357`。 |
+
+v9 严格 expanding-window CV 基线：
+
+```text
+数据：outputs/experiments_v9_full/lgbm_v5_a2lite_a2_twostage+ex2_data_full
+窗口：20 weeks，实际构造 4 folds（训练集 WEEK_NUM 最大为 91，不足 5 个完整 20-week 验证窗）
+模型：LightGBM
+Fold 1 valid 12-31：gini 0.6661
+Fold 2 valid 32-51：gini 0.6680
+Fold 3 valid 52-71：gini 0.7006
+Fold 4 valid 72-91：gini 0.7395
+mean_gini：0.6935
+min_gini：0.6661
+std_gini：0.0298
+last20_gini：0.7395
+mean_stability：0.6024
+min_stability：0.4916
+```
+
+v9 多模型 CV 对比：
+
+```text
+同一份 v9 特征：a2_twostage+ex2_data
+同一套验证：strict expanding-window，20 weeks，实际 4 folds
+
+LightGBM:
+  mean_gini       0.6935
+  min_gini        0.6661
+  std_gini        0.0298
+  last20_gini     0.7395
+  mean_stability  0.6024
+
+CatBoost:
+  mean_gini       0.6868
+  min_gini        0.6629
+  std_gini        0.0268
+  last20_gini     0.7287
+  mean_stability  0.6310
+
+XGBoost:
+  mean_gini       0.6981
+  min_gini        0.6757
+  std_gini        0.0251
+  last20_gini     0.7374
+  mean_stability  0.6110
+```
+
+当前判断：
+- XGBoost 的 `mean_gini` 和 `min_gini` 最好，说明它作为第二模型有价值。
+- LightGBM 的 `last20_gini` 仍然最好，不能直接替换。
+- CatBoost 单模 gini 不如 LGB/XGB，但稳定性略高，是否进入融合要看后续 OOF 融合权重。
+
+v10 单模型特征精筛版：
+
+```text
+目标：不做模型融合，只按高手流程对 v9 特征体系做低风险精筛。
+方法：
+  - 基于 feature_health / importance / IV / PSI 报告生成 conservative drop list。
+  - 删除 48 个低风险列：重复列、样本常量列、明显无意义的类别 sum、少数低 gain 高 PSI 列。
+  - 保留 v9 的核心特征工程：a2_twostage + ex2_data。
+  - 模型仍为单 LightGBM。
+
+宽表：
+  base: outputs/experiments_v9_full/lgbm_v5_a2lite_a2_twostage+ex2_data_full
+  refined: outputs/experiments_v10/lgbm_v5_a2lite_a2_twostage+ex2_data_refined_full
+  drop list: outputs/experiments_v10/v10_conservative_drop_list.csv
+
+strict expanding-window CV:
+  v9 mean_gini      0.6935
+  v10 mean_gini     0.6937
+  v9 last20_gini    0.7395
+  v10 last20_gini   0.7397
+  v9 mean_stability 0.6024
+  v10 mean_stability 0.6215
+
+last-20 holdout train_model:
+  auc        0.8715
+  gini       0.7430
+  stability  0.7245
+  n_features 628
+  best_iteration 891
+
+提交文件：
+  notebook: submission/v10_inference_only.ipynb
+  artifact: submission/artifact_v10/
+```
+
+v11/v12 多模型融合版：
+
+```text
+目标：在 v9 特征体系上做模型融合，不引入 v10 精筛特征。
+原因：v10 public LB 为 0.55324，略低于 v9 的 0.55357；因此融合底座回到 v9。
+
+特征：
+  a2_twostage + ex2_data
+
+模型：
+  LightGBM：复用 v9 final model
+  XGBoost：新训练 final model，900 trees，hist
+  CatBoost：新训练 final model，900 iterations，depth 8
+
+CV 参考：
+  LightGBM mean_gini 0.6935，last20_gini 0.7395
+  XGBoost  mean_gini 0.6981，last20_gini 0.7374
+  CatBoost mean_gini 0.6868，last20_gini 0.7287
+
+初始融合权重：
+  LightGBM 0.45
+  XGBoost  0.45
+  CatBoost 0.10
+
+OOF 权重搜索：
+  输出目录：outputs/experiments_v11/oof_blend_v9/
+  OOF 行数：1,333,689
+  搜索步长：0.05
+  CatBoost 最大权重：0.30
+
+OOF 单模型：
+  LightGBM gini 0.6867，stability 0.6725
+  XGBoost  gini 0.6914，stability 0.6790
+  CatBoost gini 0.6781，stability 0.6688
+
+最终融合权重（作为 Kaggle Version 12 提交）：
+  LightGBM 0.30
+  XGBoost  0.60
+  CatBoost 0.10
+
+OOF 融合效果：
+  gini       0.6934
+  mean_gini  0.6967
+  stability  0.6808
+
+判断：
+  OOF 搜索确认 XGBoost 权重应该高于 LightGBM；CatBoost 单模较弱但有少量多样性，因此保留 0.10。
+  DNN 暂不纳入：本地 hcrisk 环境没有 torch/tensorflow，sklearn MLP 对该规模数据不可控，且 Kaggle 复现风险更高。
+
+提交文件：
+  v11 初版 notebook: submission/v11_inference_only.ipynb
+  v11 初版 artifact: submission/artifact_v11/
+  v12 OOF 权重版 notebook: submission/v12_inference_only.ipynb
+  v12 OOF 权重版 artifact: submission/artifact_v12/
+```
 
 ## 当前最重要结论
 
@@ -387,3 +529,126 @@ Kaggle notebook 不能直接 import 本地 `src/`，所以 `scripts/build_notebo
 面试表达可以简化成：
 
 > 我先把 Home Credit 的多源多深度关系表统一压缩成 `case_id` 级宽表，再固定时间切分 CV，逐步做表级和聚合方法 ablation。后续从暴力聚合改成按表、按字段语义定制聚合，例如金额、日期、类别、逾期字段分别采用不同聚合方式，并用 IV、PSI、feature importance 和时间 CV 辅助筛选，最终以 Kaggle LB 做外部验证。
+
+## 新增实验工具用法
+
+基础清理体检：
+
+```bash
+conda run -n hcrisk python feature_lab/feature_health.py --input outputs/experiments_v9_full/lgbm_v5_a2lite_a2_twostage+ex2_data_full/train_filtered.parquet --output-dir outputs/feature_lab/v9_health
+```
+
+IV / PSI / 单变量 AUC：
+
+```bash
+conda run -n hcrisk python feature_lab/feature_report.py --input outputs/experiments_v9_full/lgbm_v5_a2lite_a2_twostage+ex2_data_full/train_filtered.parquet --output outputs/feature_lab/v9_feature_report.csv --max-features 1000
+```
+
+模型 importance 合并 IV/PSI：
+
+```bash
+conda run -n hcrisk python feature_lab/model_importance_report.py --artifact-dir submission/artifact_v9 --feature-report outputs/feature_lab/v9_feature_report.csv --output outputs/feature_lab/v9_importance_report.csv
+```
+
+表级 ablation 示例：
+
+```bash
+conda run -n hcrisk python scripts/train_features.py --preset medium --feature-set a2_twostage+ex2_data --output-dir outputs/experiments_ablation --sample-rows 300000 --features-only --exclude-prefix credit_bureau_a_1__
+```
+
+聚合方法 ablation 示例：
+
+```bash
+conda run -n hcrisk python scripts/train_features.py --preset medium --feature-set a2_twostage+ex2_data --output-dir outputs/experiments_ablation --sample-rows 300000 --features-only --exclude-agg sum --exclude-agg std
+```
+
+严格 5-window CV：
+
+```bash
+conda run -n hcrisk python scripts/cv_features.py --run-dir outputs/experiments_ablation/lgbm_v5_medium_a2_twostage+ex2_data_sample300000
+```
+
+missing flag 实验：
+
+```bash
+conda run -n hcrisk python scripts/train_features.py --preset medium --feature-set a2_twostage+ex2_data --output-dir outputs/experiments_missing --sample-rows 300000 --missing-indicator-min-rate 0.05
+```
+
+## 2026-06-18 v13 表级 / 聚合 / 语义特征实验记录
+
+本轮目标是补高手流程里的第 3/4 步：先做表级 ablation 和聚合方法 ablation，再做第二轮语义特征，而不是直接盲目堆特征。
+
+### 表级 ablation 结论
+
+基准是 v9 strict expanding-window CV：
+
+```text
+mean_gini   0.69355
+min_gini    0.66613
+last20_gini 0.73947
+```
+
+删除单表后的结果：
+
+```text
+drop_person_all        mean_gini 0.67855  明显大跌，person 是强表
+drop_credit_bureau_a_1 mean_gini 0.68063  明显大跌，bureau_a_1 是强表
+drop_credit_bureau_a_2 mean_gini 0.69081  有贡献，保留
+drop_applprev_1        mean_gini 0.69224  有贡献，保留
+drop_tax_all           mean_gini 0.69270  偏弱但仍有贡献
+drop_deposit_debitcard mean_gini 0.69361  几乎不伤 mean，但 last20 下降，后续可简化而不是直接删
+```
+
+结论：后续语义特征优先围绕 `person`、`credit_bureau_a_1`、`credit_bureau_a_2`、`applprev_1` 做；小表先保持保守。
+
+### 聚合方法 ablation 结论
+
+```text
+drop_first_last mean_gini 0.67947  大跌，first/last 很重要
+drop_std        mean_gini 0.69261  有损失，std 不能全删
+drop_median     mean_gini 0.69217  有损失
+drop_count      mean_gini 0.69252  有损失
+drop_sum_std    mean_gini 0.69235  有损失
+drop_sum        mean_gini 0.69361  mean 略高但 last20 略低
+```
+
+结论：不能粗暴整类删除聚合。`first/last` 尤其重要；`sum` 可以后续按字段语义选择性保留，不应对日期/类别乱做 sum。
+
+### 第二轮语义特征
+
+新增 `semantic_v2`，主要包含：
+
+```text
+person：年龄、收入/贷款/年金/负债比例
+bureau_a_1：最大 DPD、逾期次数、逾期金额、逾期金额/未偿债务、债务/额度、信用历史跨度
+applprev_1：历史最大 DPD、DPD/历史申请数、历史授信/当前授信比例
+credit_bureau_a_2：A2 最大 DPD、active/closed DPD 差值、DPD 阈值比例、逾期金额/还款记录数
+```
+
+先跑全量 `semantic_v2`：
+
+```text
+mean_gini   0.69381
+min_gini    0.66763
+last20_gini 0.73715
+```
+
+解释：多窗口 mean/min 更好，但 last20 下降，说明全量语义特征里有噪声项。
+
+随后用 IV / PSI / 单变量 AUC 做组内筛选，删除低 IV 或高 PSI 的弱项，形成 `semantic_v2_stable_from_full`：
+
+```text
+mean_gini   0.69498
+min_gini    0.66860
+last20_gini 0.74086
+```
+
+相对 v9：
+
+```text
+mean_gini   +0.00143
+min_gini    +0.00247
+last20_gini +0.00140
+```
+
+当前判断：`semantic_v2_stable_from_full` 是目前最有希望的 v13 特征候选，比单纯 v9 特征更稳，也没有牺牲 last20。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from pathlib import Path
 
@@ -24,6 +25,24 @@ def embedded_source(path: str) -> str:
     return "\n".join(lines)
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build an inference-only LightGBM submission notebook.")
+    parser.add_argument("--output", type=Path, default=Path("submission/v9_inference_only.ipynb"))
+    parser.add_argument("--version-label", default="V9")
+    parser.add_argument("--working-dir-name", default="kaggle_v9")
+    return parser.parse_args()
+
+
+args = parse_args()
+extra_artifact_candidates = ""
+if args.version_label.upper() in {"V10", "V11", "V12"}:
+    version_lower = args.version_label.lower()
+    extra_artifact_candidates = (
+        f'        Path("/kaggle/input/home-credit-{version_lower}-artifacts"),\n'
+        f'        Path("/kaggle/input/hcrisk-{version_lower}-artifacts"),\n'
+        f'        Path("submission/artifact_{version_lower}"),\n'
+    )
+
 features_source = embedded_source("src/features.py")
 memory_source = embedded_source("src/memory.py")
 preprocess_source = embedded_source("src/preprocess.py")
@@ -32,7 +51,7 @@ feature_filter_source = embedded_source("src/feature_filter.py")
 cells = [
     markdown_cell(
         """
-# V9 Inference-Only LightGBM Submission
+# {version_label} Inference-Only LightGBM Submission
 
 This notebook does not train a model on Kaggle.
 
@@ -46,7 +65,7 @@ Expected inputs:
   - `selected_polars_columns.json`
 
 The notebook builds test features, including `credit_bureau_a_2` two-stage aggregation and table-specific aggregation rules when requested by the manifest, writes the selected matrix to disk, releases memory, then predicts in chunks.
-"""
+""".replace("{version_label}", args.version_label)
     ),
     code_cell(
         """
@@ -95,7 +114,7 @@ def find_kaggle_data_dir() -> Path | None:
 
 def find_artifact_dir() -> Path:
     candidates = [
-        Path("/kaggle/input/home-credit-v6-artifacts"),
+{extra_artifact_candidates}        Path("/kaggle/input/home-credit-v6-artifacts"),
         Path("/kaggle/input/home-credit-v9-artifacts"),
         Path("/kaggle/input/home-credit-v8-artifacts"),
         Path("/kaggle/input/hcrisk-v6-artifacts"),
@@ -124,7 +143,7 @@ def find_artifact_dir() -> Path:
 KAGGLE_ROOT = next((path for path in KAGGLE_ROOT_CANDIDATES if path.exists()), None)
 ROOT = KAGGLE_ROOT if KAGGLE_ROOT is not None else (find_kaggle_data_dir() or find_local_data_dir())
 ARTIFACT_DIR = find_artifact_dir()
-WORKING = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path("outputs/kaggle_v9")
+WORKING = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path("outputs/{working_dir_name}")
 WORKING.mkdir(parents=True, exist_ok=True)
 
 sample_submission = pd.read_csv(ROOT / "sample_submission.csv")
@@ -140,7 +159,7 @@ print({
     "dry_run": DRY_RUN,
     "sample_submission_rows": int(sample_submission.shape[0]),
 })
-"""
+""".replace("{working_dir_name}", args.working_dir_name).replace("{extra_artifact_candidates}", extra_artifact_candidates)
     ),
     code_cell(memory_source + "\n\nlog_memory('initialized')"),
     code_cell(features_source),
@@ -155,6 +174,7 @@ state = PreprocessState(
     category_maps=preprocess_payload["category_maps"],
     fill_values=preprocess_payload["fill_values"],
     dropped_columns=preprocess_payload["dropped_columns"],
+    missing_indicator_cols=preprocess_payload.get("missing_indicator_cols", {}),
 )
 PRESET = manifest["preset"]
 FEATURE_SET = manifest.get("feature_set", "none")
@@ -201,8 +221,35 @@ check_memory("after write selected test parquet", MAX_RSS_GB, MIN_AVAILABLE_GB)
     ),
     code_cell(
         """
-model = joblib.load(ARTIFACT_DIR / manifest["files"]["model"])
-check_memory("after load model", MAX_RSS_GB, MIN_AVAILABLE_GB)
+files = manifest["files"]
+blend = manifest.get("blend", {})
+lightgbm_weight = float(blend.get("lightgbm_weight", 1.0))
+xgboost_weight = float(blend.get("xgboost_weight", 0.0))
+catboost_weight = float(blend.get("catboost_weight", 0.0))
+
+lightgbm_model = joblib.load(ARTIFACT_DIR / files.get("lightgbm_model", files["model"]))
+xgboost_model = None
+catboost_model = None
+if "xgboost_model" in files and (ARTIFACT_DIR / files["xgboost_model"]).exists():
+    xgboost_model = joblib.load(ARTIFACT_DIR / files["xgboost_model"])
+if "catboost_model" in files and (ARTIFACT_DIR / files["catboost_model"]).exists():
+    catboost_model = joblib.load(ARTIFACT_DIR / files["catboost_model"])
+
+weight_total = lightgbm_weight
+if xgboost_model is not None:
+    weight_total += xgboost_weight
+if catboost_model is not None:
+    weight_total += catboost_weight
+if weight_total <= 0:
+    raise ValueError("Invalid blend weights.")
+
+print({
+    "lightgbm_weight": lightgbm_weight,
+    "xgboost_weight": xgboost_weight if xgboost_model is not None else 0.0,
+    "catboost_weight": catboost_weight if catboost_model is not None else 0.0,
+    "weight_total": weight_total,
+})
+check_memory("after load models", MAX_RSS_GB, MIN_AVAILABLE_GB)
 
 pred_chunks = []
 id_chunks = []
@@ -215,14 +262,19 @@ for idx, batch in enumerate(parquet_file.iter_batches(batch_size=BATCH_SIZE), st
     del batch_pdf, batch
     gc.collect()
     check_memory(f"before predict batch {idx}", MAX_RSS_GB, MIN_AVAILABLE_GB)
-    pred = model.predict_proba(X_batch)[:, 1].astype(np.float32)
+    pred = lightgbm_weight * lightgbm_model.predict_proba(X_batch)[:, 1]
+    if xgboost_model is not None:
+        pred = pred + xgboost_weight * xgboost_model.predict_proba(X_batch)[:, 1]
+    if catboost_model is not None:
+        pred = pred + catboost_weight * catboost_model.predict_proba(X_batch)[:, 1]
+    pred = (pred / weight_total).astype(np.float32)
     pred_chunks.append(pred)
     del X_batch, pred
     gc.collect()
 
 predictions = np.concatenate(pred_chunks)
 test_ids = np.concatenate(id_chunks)
-del pred_chunks, id_chunks, parquet_file, model
+del pred_chunks, id_chunks, parquet_file, lightgbm_model, xgboost_model, catboost_model
 gc.collect()
 check_memory("after batch prediction", MAX_RSS_GB, MIN_AVAILABLE_GB)
 
@@ -249,7 +301,7 @@ notebook = {
     "nbformat_minor": 5,
 }
 
-out_path = Path("submission/v9_inference_only.ipynb")
+out_path = args.output
 out_path.parent.mkdir(parents=True, exist_ok=True)
 out_path.write_text(json.dumps(notebook, ensure_ascii=False, indent=1), encoding="utf-8")
 print(f"Wrote {out_path}")

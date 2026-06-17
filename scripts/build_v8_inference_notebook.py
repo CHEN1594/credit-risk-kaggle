@@ -151,6 +151,7 @@ state = PreprocessState(
     category_maps=preprocess_payload["category_maps"],
     fill_values=preprocess_payload["fill_values"],
     dropped_columns=preprocess_payload["dropped_columns"],
+    missing_indicator_cols=preprocess_payload.get("missing_indicator_cols", {}),
 )
 PRESET = manifest["preset"]
 FEATURE_SET = manifest.get("feature_set", "none")

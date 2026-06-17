@@ -45,3 +45,29 @@ def hash_string_columns(df: pl.DataFrame, seed: int = 42) -> pl.DataFrame:
             encoded = pl.col(col).hash(seed=seed).mod(2_147_483_647).cast(pl.Int32)
             exprs.append(pl.when(pl.col(col).is_null()).then(pl.lit(-1)).otherwise(encoded).alias(col))
     return df.with_columns(exprs) if exprs else df
+
+
+def drop_experiment_columns(
+    df: pl.DataFrame,
+    *,
+    exclude_prefixes: list[str] | None = None,
+    exclude_aggs: list[str] | None = None,
+) -> tuple[pl.DataFrame, dict[str, list[str]]]:
+    protected = {"case_id", "target", "WEEK_NUM"}
+    exclude_prefixes = exclude_prefixes or []
+    exclude_aggs = exclude_aggs or []
+    dropped: dict[str, list[str]] = {"prefix": [], "agg": []}
+
+    for col in df.columns:
+        if col in protected:
+            continue
+        if any(col.startswith(prefix) for prefix in exclude_prefixes):
+            dropped["prefix"].append(col)
+            continue
+        if any(col.endswith(f"__{agg}") for agg in exclude_aggs):
+            dropped["agg"].append(col)
+
+    to_drop = sorted(set(dropped["prefix"] + dropped["agg"]))
+    if not to_drop:
+        return df, dropped
+    return df.drop(to_drop), dropped
