@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 from src.feature_filter import hash_string_columns, select_polars_columns
 from src.features import build_features
 from src.memory import check_memory
+from src.metric_hack import apply_metric_hack
 from src.preprocess import PreprocessState, apply_preprocessor
 
 
@@ -30,6 +31,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rss-gb", type=float, default=30.0)
     parser.add_argument("--min-available-gb", type=float, default=8.0)
     parser.add_argument("--batch-size", type=int, default=100_000)
+    parser.add_argument("--metric-hack", action="store_true")
+    parser.add_argument("--metric-hack-divide", type=float, default=0.5)
+    parser.add_argument("--metric-hack-reduce", type=float, default=0.03)
     return parser.parse_args()
 
 
@@ -106,6 +110,14 @@ def main() -> None:
     submission = pd.DataFrame({"case_id": test_ids, "score": predictions})
     submission = sample_submission[["case_id"]].merge(submission, on="case_id", how="left")
     submission["score"] = submission["score"].fillna(float(np.mean(predictions)))
+    if args.metric_hack:
+        submission, mh_summary = apply_metric_hack(
+            submission,
+            args.data_dir,
+            divide=args.metric_hack_divide,
+            reduce=args.metric_hack_reduce,
+        )
+        print(json.dumps({"metric_hack": mh_summary}, indent=2))
     submission.to_csv(args.output_path, index=False)
     shutil.rmtree(temp_dir, ignore_errors=True)
     print(submission.shape)

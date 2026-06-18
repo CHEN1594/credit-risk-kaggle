@@ -1,0 +1,55 @@
+{
+  "version": "v14",
+  "model_kind": "sota_lgb_644_refit_all",
+  "preset": "sota_lgb",
+  "feature_set": "sota_lgb_644",
+  "max_missing": 0.95,
+  "max_cat_unique": 50,
+  "missing_indicator_min_rate": null,
+  "use_float16": true,
+  "string_hash_seed": 42,
+  "exclude_prefix": [],
+  "exclude_agg": [],
+  "best_iteration": 1561,
+  "metrics": {
+    "auc": 0.8716915828132632,
+    "gini": 0.7433831656265264,
+    "valid_start_week": 72,
+    "valid_rows": 212203,
+    "train_rows": 1314456,
+    "best_iteration": 1561,
+    "preset": "sota_lgb",
+    "sample_rows": 0,
+    "max_missing": 0.95,
+    "max_cat_unique": 50,
+    "polars_drop_summary": {
+      "missing": 158,
+      "constant": 1,
+      "high_cardinality": 4
+    },
+    "experiment_drop_summary": {
+      "prefix": 0,
+      "agg": 0
+    },
+    "drop_summary": {
+      "missing": 0,
+      "constant": 10,
+      "high_cardinality": 0,
+      "kept": 570,
+      "missing_indicators": 0
+    },
+    "n_features": 570,
+    "stability": 0.7239378048314565,
+    "mean_gini": 0.7388478675396442,
+    "slope": 0.0012976415831383982,
+    "falling_rate": 0.0,
+    "residual_std": 0.029820125416375225,
+    "n_weeks": 20.0
+  },
+  "files": {
+    "model": "model.joblib",
+    "preprocess": "preprocess.json",
+    "feature_columns": "feature_columns.json",
+    "selected_polars_columns": "selected_polars_columns.json"
+  }
+}

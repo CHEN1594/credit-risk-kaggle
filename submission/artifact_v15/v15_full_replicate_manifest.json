@@ -1,0 +1,34 @@
+{
+  "version": "v15",
+  "model_kind": "first_place_style_lgb_cat_dnn_metric_hack",
+  "branches": {
+    "lgb644": {
+      "artifact_dir": "lgb644",
+      "weight": 0.4,
+      "feature_set": "sota_lgb_644",
+      "source": "first-place LGB 644 reference feature engineering"
+    },
+    "catboost661": {
+      "artifact_dir": "catdnn661",
+      "weight": 0.36,
+      "feature_set": "sota_cat_661",
+      "source": "first-place CatBoost 661 reference feature engineering"
+    },
+    "dnn661": {
+      "artifact_dir": "catdnn661",
+      "weight": 0.24,
+      "feature_set": "sota_cat_661",
+      "framework": "pytorch",
+      "source": "tabular DNN trained on the 661 Cat/DNN feature branch"
+    }
+  },
+  "metric_hack": {
+    "enabled": true,
+    "divide": 0.5,
+    "reduce": 0.03
+  },
+  "notes": [
+    "The public reference includes LGB and CatBoost inference code, but not the original Denselight training code or model weights.",
+    "The DNN branch is a PyTorch tabular MLP trained locally on the same 661 feature branch instead of XGBoost substitution."
+  ]
+}

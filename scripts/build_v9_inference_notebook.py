@@ -30,23 +30,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("submission/v9_inference_only.ipynb"))
     parser.add_argument("--version-label", default="V9")
     parser.add_argument("--working-dir-name", default="kaggle_v9")
+    parser.add_argument("--metric-hack", action="store_true")
+    parser.add_argument("--metric-hack-divide", type=float, default=0.5)
+    parser.add_argument("--metric-hack-reduce", type=float, default=0.03)
     return parser.parse_args()
 
 
 args = parse_args()
 extra_artifact_candidates = ""
-if args.version_label.upper() in {"V10", "V11", "V12"}:
+if args.version_label.upper() in {"V10", "V11", "V12", "V13", "V14", "V15"}:
     version_lower = args.version_label.lower()
     extra_artifact_candidates = (
         f'        Path("/kaggle/input/home-credit-{version_lower}-artifacts"),\n'
         f'        Path("/kaggle/input/hcrisk-{version_lower}-artifacts"),\n'
         f'        Path("submission/artifact_{version_lower}"),\n'
     )
+if args.version_label.upper() in {"V13", "V14", "V15"}:
+    extra_artifact_candidates += (
+        '        Path("/kaggle/input/home-credit-v11-artifacts"),\n'
+        '        Path("/kaggle/input/hcrisk-v11-artifacts"),\n'
+        '        Path("submission/artifact_v11"),\n'
+    )
 
 features_source = embedded_source("src/features.py")
 memory_source = embedded_source("src/memory.py")
 preprocess_source = embedded_source("src/preprocess.py")
 feature_filter_source = embedded_source("src/feature_filter.py")
+metric_hack_source = embedded_source("src/metric_hack.py")
 
 cells = [
     markdown_cell(
@@ -151,6 +161,9 @@ DRY_RUN = sample_submission.shape[0] == 10
 MAX_RSS_GB = 30.0
 MIN_AVAILABLE_GB = 8.0
 BATCH_SIZE = 100_000
+METRIC_HACK_ENABLED = {metric_hack_enabled}
+METRIC_HACK_DIVIDE = {metric_hack_divide}
+METRIC_HACK_REDUCE = {metric_hack_reduce}
 
 print({
     "root": str(ROOT),
@@ -158,13 +171,21 @@ print({
     "working": str(WORKING),
     "dry_run": DRY_RUN,
     "sample_submission_rows": int(sample_submission.shape[0]),
+    "metric_hack_enabled": METRIC_HACK_ENABLED,
+    "metric_hack_divide": METRIC_HACK_DIVIDE,
+    "metric_hack_reduce": METRIC_HACK_REDUCE,
 })
-""".replace("{working_dir_name}", args.working_dir_name).replace("{extra_artifact_candidates}", extra_artifact_candidates)
+""".replace("{working_dir_name}", args.working_dir_name)
+        .replace("{extra_artifact_candidates}", extra_artifact_candidates)
+        .replace("{metric_hack_enabled}", str(bool(args.metric_hack)))
+        .replace("{metric_hack_divide}", repr(float(args.metric_hack_divide)))
+        .replace("{metric_hack_reduce}", repr(float(args.metric_hack_reduce)))
     ),
     code_cell(memory_source + "\n\nlog_memory('initialized')"),
     code_cell(features_source),
     code_cell(preprocess_source),
     code_cell(feature_filter_source),
+    code_cell(metric_hack_source),
     code_cell(
         """
 manifest = json.loads((ARTIFACT_DIR / "v5_manifest.json").read_text(encoding="utf-8"))
@@ -281,6 +302,14 @@ check_memory("after batch prediction", MAX_RSS_GB, MIN_AVAILABLE_GB)
 submission = pd.DataFrame({"case_id": test_ids, "score": predictions})
 submission = sample_submission[["case_id"]].merge(submission, on="case_id", how="left")
 submission["score"] = submission["score"].fillna(float(np.mean(predictions)))
+if METRIC_HACK_ENABLED:
+    submission, mh_summary = apply_metric_hack(
+        submission,
+        ROOT,
+        divide=METRIC_HACK_DIVIDE,
+        reduce=METRIC_HACK_REDUCE,
+    )
+    print({"metric_hack": mh_summary})
 submission.to_csv(WORKING / "submission.csv", index=False)
 submission.to_csv("submission.csv", index=False)
 

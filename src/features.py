@@ -113,6 +113,43 @@ PRESETS: dict[str, FeaturePreset] = {
             "credit_bureau_b_2",
         ),
     ),
+    "sota_lgb": FeaturePreset(
+        depth0_groups=("static_cb_0", "static_0"),
+        aggregate_groups=(
+            "applprev_1",
+            "credit_bureau_a_1",
+            "credit_bureau_b_1",
+            "deposit_1",
+            "debitcard_1",
+            "tax_registry_a_1",
+            "tax_registry_b_1",
+            "tax_registry_c_1",
+            "person_1",
+            "other_1",
+            "credit_bureau_b_2",
+            "person_2",
+        ),
+        lite_large_groups=("credit_bureau_a_2",),
+    ),
+    "sota_cat": FeaturePreset(
+        depth0_groups=("static_cb_0", "static_0"),
+        aggregate_groups=(
+            "applprev_1",
+            "tax_registry_a_1",
+            "tax_registry_b_1",
+            "tax_registry_c_1",
+            "credit_bureau_a_1",
+            "credit_bureau_b_1",
+            "other_1",
+            "person_1",
+            "deposit_1",
+            "debitcard_1",
+            "credit_bureau_b_2",
+            "applprev_2",
+            "person_2",
+        ),
+        lite_large_groups=("credit_bureau_a_2",),
+    ),
 }
 
 
@@ -537,6 +574,221 @@ def ex2_aggregate_exprs(group: str, schema: pl.Schema) -> list[pl.Expr]:
     return aggs + ex2_general_aggs(group, schema)
 
 
+def sota_relevant_columns(schema: pl.Schema) -> list[str]:
+    return [
+        col
+        for col in schema.names()
+        if col not in SPECIAL_COLUMNS and (col[-1:] in ("T", "L", "M", "D", "P", "A") or "num_group" in col)
+    ]
+
+
+def sota_num_exprs(schema: pl.Schema) -> list[pl.Expr]:
+    cols = sota_relevant_columns(schema)
+    aggs: list[pl.Expr] = []
+    for col in cols:
+        base = numeric_expr(col)
+        aggs.extend([base.max().alias(f"max_{col}"), base.min().alias(f"min_{col}")])
+    for col in [col for col in schema.names() if col[-1:] in ("L", "A") and col not in SPECIAL_COLUMNS]:
+        base = numeric_expr(col)
+        aggs.extend(
+            [
+                base.mean().alias(f"mean_{col}"),
+                base.std().alias(f"std_{col}"),
+                base.sum().alias(f"sum_{col}"),
+                base.median().alias(f"median_{col}"),
+            ]
+        )
+    return aggs
+
+
+SOTA_BUREAU_A1_EXTRA_COLUMNS = (
+    "annualeffectiverate_199L",
+    "annualeffectiverate_63L",
+    "contractsum_5085717L",
+    "credlmt_230A",
+    "credlmt_935A",
+    "nominalrate_281L",
+    "nominalrate_498L",
+    "numberofcontrsvalue_258L",
+    "numberofcontrsvalue_358L",
+    "numberofinstls_229L",
+    "numberofinstls_320L",
+    "numberofoutstandinstls_520L",
+    "numberofoutstandinstls_59L",
+    "numberofoverdueinstlmax_1039L",
+    "numberofoverdueinstlmax_1151L",
+    "numberofoverdueinstls_725L",
+    "numberofoverdueinstls_834L",
+)
+SOTA_PERSON1_FIRST_COLUMNS = (
+    "empl_employedtotal_800L",
+    "empl_employedfrom_271D",
+    "empl_industry_691L",
+    "familystate_447L",
+    "incometype_1044T",
+    "sex_738L",
+    "housetype_905L",
+    "housingtype_772L",
+    "isreference_387L",
+    "birth_259D",
+)
+SOTA_PERSON2_FIRST_LAST_COLUMNS = (
+    "empls_economicalst_849M",
+    "empls_employedfrom_796D",
+    "empls_employer_name_740M",
+)
+
+
+def sota_lgb_aggregate_exprs(group: str, schema: pl.Schema) -> list[pl.Expr]:
+    if group == "applprev_1":
+        return sota_num_exprs(schema)
+
+    if group == "credit_bureau_a_1":
+        aggs: list[pl.Expr] = []
+        for col in sota_relevant_columns(schema):
+            base = numeric_expr(col)
+            aggs.extend([base.max().alias(f"max_{col}"), base.min().alias(f"min_{col}")])
+        for col in SOTA_BUREAU_A1_EXTRA_COLUMNS:
+            if col in schema:
+                base = numeric_expr(col)
+                aggs.extend(
+                    [
+                        base.mean().alias(f"mean_{col}"),
+                        base.std().alias(f"std_{col}"),
+                        base.sum().alias(f"sum_{col}"),
+                        base.median().alias(f"median_{col}"),
+                        base.first().alias(f"first_{col}"),
+                    ]
+                )
+        return aggs
+
+    if group in {"credit_bureau_b_1", "credit_bureau_b_2"}:
+        return []
+
+    if group in {"deposit_1", "debitcard_1"}:
+        aggs = []
+        for col in sota_relevant_columns(schema):
+            base = numeric_expr(col)
+            aggs.extend([base.max().alias(f"max_{col}"), base.min().alias(f"min_{col}")])
+        return aggs
+
+    if group == "tax_registry_a_1":
+        aggs = []
+        for col in sota_relevant_columns(schema):
+            base = numeric_expr(col)
+            aggs.extend(
+                [
+                    base.max().alias(f"max_{col}"),
+                    base.min().alias(f"min_{col}"),
+                    base.last().alias(f"last_{col}"),
+                    base.first().alias(f"first_{col}"),
+                    base.mean().alias(f"mean_{col}"),
+                    base.std().alias(f"std_{col}"),
+                ]
+            )
+        if "amount_4527230A" in schema:
+            base = numeric_expr("amount_4527230A").fill_null(0)
+            aggs.append((base.max() - base.min()).alias("max-min_gap_depth2_amount_4527230A"))
+        return aggs
+
+    if group in {"tax_registry_b_1", "tax_registry_c_1"}:
+        return sota_num_exprs(schema)
+
+    if group == "other_1":
+        return [
+            pl.col(col).first().alias(f"__other_{col}")
+            for col in schema.names()
+            if "num_group" not in col and col != "case_id"
+        ]
+
+    if group == "person_1":
+        aggs = [pl.col(col).first().alias(f"first_{col}") for col in SOTA_PERSON1_FIRST_COLUMNS if col in schema]
+        if "mainoccupationinc_384A" in schema:
+            income = numeric_expr("mainoccupationinc_384A")
+            aggs.append(income.max().alias("mainoccupationinc_384A_max"))
+            if "incometype_1044T" in schema:
+                aggs.append(
+                    income.filter(pl.col("incometype_1044T") == "SELFEMPLOYED").max().alias(
+                        "mainoccupationinc_384A_any_selfemployed"
+                    )
+                )
+        return aggs
+
+    if group == "person_2":
+        aggs = []
+        for col in SOTA_PERSON2_FIRST_LAST_COLUMNS:
+            if col in schema:
+                aggs.extend([pl.col(col).first().alias(f"first_{col}"), pl.col(col).last().alias(f"last_{col}")])
+        return aggs
+
+    return sota_num_exprs(schema)
+
+
+def sota_lgb_a2_exprs(schema: pl.Schema) -> list[pl.Expr]:
+    cols = sota_relevant_columns(schema)
+    aggs: list[pl.Expr] = []
+    for col in cols:
+        base = numeric_expr(col)
+        aggs.extend(
+            [
+                base.max().alias(f"max_depth2_{col}"),
+                base.min().alias(f"min_depth2_{col}"),
+                base.mean().alias(f"mean_depth2_{col}"),
+                base.std().alias(f"std_{col}"),
+            ]
+        )
+    for col in ("collater_valueofguarantee_1124L", "pmts_dpd_1073P", "pmts_overdue_1140A"):
+        if col in schema:
+            base = numeric_expr(col).fill_null(0)
+            aggs.append((base.max() - base.min()).alias(f"max-min_gap_depth2_{col}"))
+    if "num_group2" in schema:
+        aggs.append(pl.col("num_group2").count().alias("count_depth2_a2_num_group2"))
+    return aggs
+
+
+def sota_cat_aggregate_exprs(group: str, schema: pl.Schema) -> list[pl.Expr]:
+    aggs: list[pl.Expr] = []
+    for col, dtype in schema.items():
+        if col in SPECIAL_COLUMNS:
+            continue
+        out = f"{group}__{col}"
+        suffix = col[-1:]
+        if suffix in ("P", "A"):
+            append_agg_ops(aggs, numeric_expr(col), out, ("max", "min", "mean", "std"))
+        elif suffix == "D":
+            append_agg_ops(aggs, numeric_expr(col), out, ("max", "min"))
+        elif suffix == "M" and dtype == pl.String:
+            append_agg_ops(aggs, pl.col(col), out, ("last", "nunique", "first"))
+        elif suffix in ("T", "L"):
+            append_agg_ops(aggs, numeric_expr(col), out, ("max", "min", "sum"))
+    for col in ("num_group1", "num_group2"):
+        if col in schema:
+            append_agg_ops(aggs, numeric_expr(col), f"{group}__{col}", ("max",))
+    return aggs
+
+
+def aggregate_sota_cat_a2_eager(
+    data_dir: Path,
+    split: str,
+    group: str,
+    temp_dir: Path,
+    case_ids: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    partial_paths: list[Path] = []
+    for idx, path in enumerate(files_for_group(data_dir, split, group)):
+        lf = normalize_dates(pl.scan_parquet(str(path)))
+        if case_ids is not None:
+            lf = lf.join(case_ids.lazy(), on="case_id", how="semi")
+        schema = lf.collect_schema()
+        partial = lf.group_by("case_id").agg(sota_cat_aggregate_exprs(group, schema)).collect(engine="streaming")
+        out_path = temp_dir / f"{split}_{group}_sota_cat_partial_{idx}.parquet"
+        partial.write_parquet(out_path)
+        partial_paths.append(out_path)
+        del partial
+    return pl.scan_parquet([str(path) for path in partial_paths]).unique(subset=["case_id"]).collect(engine="streaming")
+
+
 def use_custom_aggs_for_group(components: set[str], group: str) -> bool:
     if "ex2_data" in components:
         return True
@@ -610,6 +862,14 @@ def aggregate_group(
         lf = lf.sort(["case_id", "num_group1"])
     if "ex2_data" in components:
         return lf.group_by("case_id").agg(ex2_aggregate_exprs(group, schema))
+    if "sota_lgb_644" in components:
+        if "num_group1" in schema:
+            lf = lf.sort(["case_id", "num_group1"])
+        return lf.group_by("case_id").agg(sota_lgb_aggregate_exprs(group, schema))
+    if "sota_cat_661" in components:
+        if "num_group1" in schema:
+            lf = lf.sort(["case_id", "num_group1"])
+        return lf.group_by("case_id").agg(sota_cat_aggregate_exprs(group, schema))
     aggs: list[pl.Expr] = [pl.len().alias(f"{group}__row_count")]
 
     for col, dtype in schema.items():
@@ -1211,6 +1471,8 @@ def feature_set_components(feature_set: str) -> set[str]:
         "ex2_data",
         "semantic_v2",
         "semantic_v2_stable",
+        "sota_lgb_644",
+        "sota_cat_661",
     }
     unknown = components - allowed
     if unknown:
@@ -1820,6 +2082,70 @@ def apply_derived_features(df: pl.DataFrame, feature_set: str) -> pl.DataFrame:
     return df.with_columns(exprs) if exprs else df
 
 
+def aggregate_sota_lgb_a2_eager(
+    data_dir: Path,
+    split: str,
+    group: str,
+    temp_dir: Path,
+    case_ids: pl.DataFrame | None = None,
+) -> pl.DataFrame:
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    partial_paths: list[Path] = []
+    case_ids_lf = case_ids.lazy() if case_ids is not None else None
+    for idx, path in enumerate(files_for_group(data_dir, split, group)):
+        lf = normalize_dates(pl.scan_parquet(str(path)))
+        lf = filter_cases(lf, case_ids_lf)
+        schema = lf.collect_schema()
+        partial = lf.group_by("case_id").agg(sota_lgb_a2_exprs(schema)).collect(engine="streaming")
+        out_path = temp_dir / f"{split}_{group}_sota_partial_{idx}.parquet"
+        partial.write_parquet(out_path)
+        partial_paths.append(out_path)
+        del partial
+    return pl.scan_parquet([str(path) for path in partial_paths]).unique(subset=["case_id"]).collect(engine="streaming")
+
+
+def apply_sota_lgb_postprocess(df: pl.DataFrame) -> pl.DataFrame:
+    exprs: list[pl.Expr] = []
+    if "date_decision" in df.columns:
+        decision = pl.col("date_decision").cast(pl.Float64, strict=False)
+        for col in df.columns:
+            if col == "date_decision":
+                continue
+            if col.endswith("D") and "count" not in col:
+                exprs.append((pl.col(col).cast(pl.Float64, strict=False) - decision).alias(col))
+    if exprs:
+        df = df.with_columns(exprs)
+
+    drop_cols = [col for col in ("date_decision", "MONTH") if col in df.columns]
+    drop_cols.extend(
+        [
+            col
+            for col in df.columns
+            if col not in {"target", "case_id", "WEEK_NUM"}
+            and col[-1:] not in ("P", "A", "L", "M")
+            and (("month_" in col) or ("year_" in col))
+        ]
+    )
+    if drop_cols:
+        df = df.drop(sorted(set(drop_cols)))
+    return df
+
+
+def apply_sota_cat_postprocess(df: pl.DataFrame) -> pl.DataFrame:
+    exprs: list[pl.Expr] = []
+    if "date_decision" in df.columns:
+        decision = pl.col("date_decision").cast(pl.Float64, strict=False)
+        for col in df.columns:
+            if col != "date_decision" and col.endswith("D"):
+                exprs.append((pl.col(col).cast(pl.Float64, strict=False) - decision).alias(col))
+    if exprs:
+        df = df.with_columns(exprs)
+    drop_cols = [col for col in ("date_decision", "MONTH") if col in df.columns]
+    if drop_cols:
+        df = df.drop(drop_cols)
+    return df
+
+
 def build_features(
     data_dir: Path,
     split: str,
@@ -1833,6 +2159,9 @@ def build_features(
     if preset_name not in PRESETS:
         raise ValueError(f"Unknown preset {preset_name!r}. Available: {sorted(PRESETS)}")
     preset = PRESETS[preset_name]
+    components = feature_set_components(feature_set)
+    is_sota_lgb = "sota_lgb_644" in components
+    is_sota_cat = "sota_cat_661" in components
 
     cache_path = None
     if cache_dir is not None and not sample_rows:
@@ -1843,6 +2172,13 @@ def build_features(
     lf = load_base(data_dir, split)
     if sample_rows:
         lf = lf.sort("case_id").head(sample_rows)
+    if (is_sota_lgb or is_sota_cat) and "date_decision" in lf.collect_schema():
+        lf = lf.with_columns(
+            [
+                pl.col("date_decision").cast(pl.Date).dt.month().alias("decision_month"),
+                pl.col("date_decision").cast(pl.Date).dt.weekday().alias("decision_weekday"),
+            ]
+        )
     case_ids = lf.select("case_id")
     decision_dates = lf.select(
         [
@@ -1850,26 +2186,64 @@ def build_features(
             pl.col("date_decision").cast(pl.Float64, strict=False).alias("__decision_date"),
         ]
     )
+    join_idx = 0
     for group in preset.depth0_groups:
-        lf = lf.join(load_depth0(data_dir, split, group, case_ids), on="case_id", how="left")
+        lf = lf.join(
+            load_depth0(data_dir, split, group, case_ids),
+            on="case_id",
+            how="left",
+            suffix=f"_{join_idx}" if is_sota_lgb else "_right",
+        )
+        join_idx += 1
     for group in preset.aggregate_groups:
         lf = lf.join(
             aggregate_group(data_dir, split, group, case_ids, feature_set, decision_dates),
             on="case_id",
             how="left",
+            suffix=f"_{join_idx}" if (is_sota_lgb or is_sota_cat) else "_right",
         )
-    if output_columns is not None:
+        join_idx += 1
+    if output_columns is not None and not is_sota_lgb:
         wanted = set(required_raw_columns_for_outputs(output_columns, feature_set))
         wanted.update(["case_id", "target", "WEEK_NUM"])
+        if is_sota_cat:
+            wanted.update(["date_decision", "MONTH"])
         schema = lf.collect_schema()
         lf = lf.select([col for col in schema.names() if col in wanted])
+    if is_sota_cat:
+        schema = lf.collect_schema()
+        string_hash_exprs = [
+            pl.when(pl.col(col).is_null())
+            .then(pl.lit(-1))
+            .otherwise(pl.col(col).hash(seed=42).mod(2_147_483_647).cast(pl.Int32))
+            .alias(col)
+            for col, dtype in schema.items()
+            if dtype in (pl.String, pl.Categorical)
+        ]
+        if string_hash_exprs:
+            lf = lf.with_columns(string_hash_exprs)
     df = lf.collect(engine="streaming")
     if preset.lite_large_groups:
         case_ids_df = df.select("case_id")
         temp_root = (cache_path.parent if cache_path is not None else Path("outputs/features")) / "_tmp_lite"
-        components = feature_set_components(feature_set)
         for group in preset.lite_large_groups:
-            if "a2_twostage" in components and group in TWOSTAGE_LARGE_GROUPS:
+            if is_sota_lgb and group == "credit_bureau_a_2":
+                lite = aggregate_sota_lgb_a2_eager(
+                    data_dir,
+                    split,
+                    group,
+                    temp_root / f"{split}_{group}_sota_lgb",
+                    case_ids=case_ids_df if sample_rows else None,
+                )
+            elif is_sota_cat and group == "credit_bureau_a_2":
+                lite = aggregate_sota_cat_a2_eager(
+                    data_dir,
+                    split,
+                    group,
+                    temp_root / f"{split}_{group}_sota_cat",
+                    case_ids=case_ids_df if sample_rows else None,
+                )
+            elif "a2_twostage" in components and group in TWOSTAGE_LARGE_GROUPS:
                 lite = aggregate_large_group_twostage_eager(
                     data_dir,
                     split,
@@ -1886,6 +2260,10 @@ def build_features(
                     case_ids=case_ids_df if sample_rows else None,
                 )
             df = df.join(lite, on="case_id", how="left")
+    if is_sota_lgb:
+        df = apply_sota_lgb_postprocess(df)
+    if is_sota_cat:
+        df = apply_sota_cat_postprocess(df)
     df = apply_derived_features(df, feature_set)
     if output_columns is not None:
         wanted = set(output_columns)
